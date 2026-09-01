@@ -1,0 +1,49 @@
+# =====================
+# VSCode settings
+# =====================
+.vscode/ros_env
+.cursor/
+.claude/
+
+# =====================
+# Python cache
+# =====================
+__pycache__/
+*/__pycache__/
+*.pyc
+*.pyo
+
+# =====================
+# Record data files
+# =====================
+/record/*
+*.pkl
+*.npz
+*.npy
+*.json
+
+# =====================
+# Data and logs
+# =====================
+data/
+
+# =====================
+# Media files
+# =====================
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.ply
+*.gv
+*.pdf
+
+# =====================
+# Build / Install / Dist directories
+# =====================
+build/
+*/build/
+install/
+*/install/
+dist/
+*/dist/
