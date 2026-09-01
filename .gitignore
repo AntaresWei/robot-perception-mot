@@ -3,7 +3,6 @@
 # =====================
 .vscode/ros_env
 .cursor/
-.claude/
 
 # =====================
 # Python cache
@@ -47,3 +46,9 @@ install/
 */install/
 dist/
 */dist/
+
+# =====================
+# Program
+# =====================
+JMODT-main/
+codex-log-kit/
