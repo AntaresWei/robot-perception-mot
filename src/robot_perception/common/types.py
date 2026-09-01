@@ -16,9 +16,30 @@ PointCloud: TypeAlias = np.ndarray
 class Calibration:
     """Camera-LiDAR calibration matrices, expressed in their documented frames."""
 
-    projection_matrix: Matrix | None = None
-    rectification_matrix: Matrix | None = None
-    lidar_to_camera_matrix: Matrix | None = None
+    p0: Matrix | None = None
+    p1: Matrix | None = None
+    p2: Matrix | None = None
+    p3: Matrix | None = None
+    r0_rect: Matrix | None = None
+    tr_velo_to_cam: Matrix | None = None
+    tr_imu_to_velo: Matrix | None = None
+
+
+@dataclass
+class KittiTrackingAnnotation:
+    """One KITTI Tracking `label_02` record in camera coordinates."""
+
+    frame_id: int
+    track_id: int
+    class_name: str
+    truncation: float
+    occlusion: int
+    alpha: float
+    bbox_2d: Vector
+    dimensions: Vector
+    location: Vector
+    yaw: float
+    score: float | None = None
 
 
 @dataclass
@@ -30,7 +51,7 @@ class FrameData:
     image: np.ndarray | None
     lidar_points: PointCloud
     calibration: Calibration | None
-    annotations: list[object] | None = None
+    annotations: list[KittiTrackingAnnotation] | None = None
     timestamp: float | None = None
 
 

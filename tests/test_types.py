@@ -8,7 +8,7 @@ from robot_perception.common.types import Calibration, Detection3D, FrameData, T
 
 
 def test_core_dataclasses_preserve_declared_values() -> None:
-    calibration = Calibration(projection_matrix=np.eye(3))
+    calibration = Calibration(p2=np.eye(3, 4))
     frame = FrameData(
         sequence_id="0000",
         frame_id=0,
