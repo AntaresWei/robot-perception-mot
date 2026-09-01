@@ -1,0 +1,6 @@
+dataset:
+  root: /path/to/kitti/tracking
+  sequences:
+    - "0000"
+    - "0001"
+    - "0002"

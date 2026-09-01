@@ -1,0 +1,7 @@
+tracker:
+  min_hits: 3
+  max_age: 5
+
+gating:
+  enabled: true
+  threshold: 9.21

@@ -1,8 +1,9 @@
 # =====================
-# VSCode settings
+# IDE
 # =====================
-.vscode/ros_env
+.vscode/
 .cursor/
+.idea/
 
 # =====================
 # Python cache
@@ -11,6 +12,8 @@ __pycache__/
 */__pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+*.egg-info/
 
 # =====================
 # Record data files
@@ -24,7 +27,15 @@ __pycache__/
 # =====================
 # Data and logs
 # =====================
-data/
+data/*
+!data/README.md
+
+# =====================
+# Outputs
+# =====================
+outputs/logs/*
+outputs/metrics/*
+outputs/visualizations/*
 
 # =====================
 # Media files
