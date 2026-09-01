@@ -1,0 +1,16 @@
+# 变更清单
+
+基线 `8323bafab64e4bcb5fac1b30e2cb1e48e37aef1e` → 当前工作区 ｜ 10 个文件，+465 / -45
+
+```
+50	0	README.md
+4	1	configs/dataset.yaml
+0	34	readme.md
+14	2	src/robot_perception/__init__.py
+14	2	src/robot_perception/common/__init__.py
+25	4	src/robot_perception/common/types.py
+5	1	src/robot_perception/dataset/__init__.py
+259	0	src/robot_perception/dataset/kitti.py
+93	0	tests/test_kitti.py
+1	1	tests/test_types.py
+```

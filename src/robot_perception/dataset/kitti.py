@@ -1,4 +1,4 @@
-"""KITTI Tracking dataset reader without detector or training-framework dependencies."""
+"""Minimal KITTI Tracking image, LiDAR, and label reader."""
 
 from __future__ import annotations
 
@@ -8,14 +8,13 @@ from pathlib import Path
 
 import numpy as np
 
-from robot_perception.common.types import Calibration, FrameData, KittiTrackingAnnotation
+from robot_perception.common.types import FrameData, KittiTrackingAnnotation
 
 
 @dataclass(frozen=True)
 class _DatasetPaths:
     image_dir: Path
     lidar_dir: Path
-    calibration_dir: Path
     label_dir: Path | None
 
 
@@ -26,11 +25,11 @@ class _FrameKey:
 
 
 class KittiTrackingDataset(Sequence[FrameData]):
-    """Read KITTI Tracking frames from standard or split-download directory layouts.
+    """Read raw KITTI Tracking frames without calibration or algorithm logic.
 
-    Images are returned in OpenCV BGR order. LiDAR points are `float32` arrays
-    with shape `(N, 4)` in `[x, y, z, intensity]` order. Labels are available
-    only for the training split.
+    Images use OpenCV BGR order. LiDAR points are `float32` arrays of shape
+    `(N, 4)` in `[x, y, z, intensity]` order. `FrameData.calibration` is
+    `None`: calibration parsing belongs to a later dedicated module.
     """
 
     def __init__(
@@ -62,20 +61,21 @@ class KittiTrackingDataset(Sequence[FrameData]):
         )
         missing_sequences = sorted(set(requested_sequences) - set(available_sequences))
         if missing_sequences:
-            joined = ", ".join(missing_sequences)
-            raise FileNotFoundError(f"requested KITTI sequences are unavailable: {joined}")
+            raise FileNotFoundError(
+                f"requested KITTI sequences are unavailable: {', '.join(missing_sequences)}"
+            )
 
         self.sequence_ids = tuple(requested_sequences)
-        self._frames = tuple(
-            _FrameKey(sequence_id, int(path.stem))
+        self._frame_keys = tuple(
+            _FrameKey(sequence_id=sequence_id, frame_id=int(path.stem))
             for sequence_id in self.sequence_ids
             for path in sorted((self._paths.lidar_dir / sequence_id).glob("*.bin"))
         )
-        if not self._frames:
+        if not self._frame_keys:
             raise ValueError("no LiDAR frames were found for the requested KITTI sequences")
 
+        self._frame_set = set(self._frame_keys)
         self._annotations_by_sequence: dict[str, tuple[KittiTrackingAnnotation, ...]] = {}
-        self._calibrations: dict[str, Calibration] = {}
 
     @staticmethod
     def _resolve_paths(root: Path, split: str) -> _DatasetPaths:
@@ -84,39 +84,22 @@ class KittiTrackingDataset(Sequence[FrameData]):
         standard_paths = _DatasetPaths(
             image_dir=standard_root / "image_02",
             lidar_dir=standard_root / "velodyne",
-            calibration_dir=standard_root / "calib",
             label_dir=standard_label_dir if standard_label_dir.is_dir() else None,
         )
-        if all(
-            path.is_dir()
-            for path in (
-                standard_paths.image_dir,
-                standard_paths.lidar_dir,
-                standard_paths.calibration_dir,
-            )
-        ):
+        if standard_paths.image_dir.is_dir() and standard_paths.lidar_dir.is_dir():
             return standard_paths
 
-        split_download_label_dir = root / "data_tracking_label_2" / split / "label_02"
-        split_download_paths = _DatasetPaths(
+        split_label_dir = root / "data_tracking_label_2" / split / "label_02"
+        split_paths = _DatasetPaths(
             image_dir=root / "data_tracking_image_2" / split / "image_02",
             lidar_dir=root / "data_tracking_velodyne" / split / "velodyne",
-            calibration_dir=root / "data_tracking_calib" / split / "calib",
-            label_dir=split_download_label_dir if split_download_label_dir.is_dir() else None,
+            label_dir=split_label_dir if split_label_dir.is_dir() else None,
         )
-        if all(
-            path.is_dir()
-            for path in (
-                split_download_paths.image_dir,
-                split_download_paths.lidar_dir,
-                split_download_paths.calibration_dir,
-            )
-        ):
-            return split_download_paths
+        if split_paths.image_dir.is_dir() and split_paths.lidar_dir.is_dir():
+            return split_paths
 
         raise FileNotFoundError(
-            "KITTI Tracking layout not found under "
-            f"{root}. Expected either {standard_root} or data_tracking_* directories."
+            f"KITTI Tracking image_02 and velodyne directories were not found under {root}"
         )
 
     @staticmethod
@@ -131,13 +114,28 @@ class KittiTrackingDataset(Sequence[FrameData]):
         return tuple(sorted(path.name for path in self._paths.lidar_dir.iterdir() if path.is_dir()))
 
     def __len__(self) -> int:
-        return len(self._frames)
+        return len(self._frame_keys)
 
     def __getitem__(self, index: int | slice) -> FrameData | list[FrameData]:
         if isinstance(index, slice):
             return [self[position] for position in range(*index.indices(len(self)))]
+        return self._read_frame(self._frame_keys[index])
 
-        frame_key = self._frames[index]
+    def __iter__(self) -> Iterator[FrameData]:
+        for index in range(len(self)):
+            yield self[index]
+
+    def get_frame(self, sequence_id: str | int, frame_id: int) -> FrameData:
+        """Load one known frame by KITTI sequence and frame identifier."""
+
+        frame_key = _FrameKey(self._normalise_sequence_id(sequence_id), frame_id)
+        if frame_key not in self._frame_set:
+            raise FileNotFoundError(
+                f"KITTI frame not found: sequence={frame_key.sequence_id}, frame={frame_key.frame_id:06d}"
+            )
+        return self._read_frame(frame_key)
+
+    def _read_frame(self, frame_key: _FrameKey) -> FrameData:
         image = self._read_image(frame_key) if self.load_images else None
         annotations = self._annotations_for_frame(frame_key) if self.load_annotations else None
         return FrameData(
@@ -145,14 +143,10 @@ class KittiTrackingDataset(Sequence[FrameData]):
             frame_id=frame_key.frame_id,
             image=image,
             lidar_points=self._read_lidar(frame_key),
-            calibration=self._calibration_for_sequence(frame_key.sequence_id),
+            calibration=None,
             annotations=annotations,
             timestamp=None,
         )
-
-    def __iter__(self) -> Iterator[FrameData]:
-        for index in range(len(self)):
-            yield self[index]
 
     def _read_image(self, frame_key: _FrameKey) -> np.ndarray:
         image_path = self._paths.image_dir / frame_key.sequence_id / f"{frame_key.frame_id:06d}.png"
@@ -173,14 +167,11 @@ class KittiTrackingDataset(Sequence[FrameData]):
         lidar_path = self._paths.lidar_dir / frame_key.sequence_id / f"{frame_key.frame_id:06d}.bin"
         points = np.fromfile(lidar_path, dtype=np.float32)
         if points.size % 4 != 0:
-            raise ValueError(f"LiDAR file does not contain N x 4 float32 values: {lidar_path}")
-        return points.reshape(-1, 4)
-
-    def _calibration_for_sequence(self, sequence_id: str) -> Calibration:
-        if sequence_id not in self._calibrations:
-            calibration_path = self._paths.calibration_dir / f"{sequence_id}.txt"
-            self._calibrations[sequence_id] = self._parse_calibration(calibration_path)
-        return self._calibrations[sequence_id]
+            raise ValueError(f"invalid LiDAR file; expected N x 4 float32 values: {lidar_path}")
+        points = points.reshape(-1, 4)
+        if not np.isfinite(points).all():
+            raise ValueError(f"LiDAR points contain NaN or Inf values: {lidar_path}")
+        return points
 
     def _annotations_for_frame(self, frame_key: _FrameKey) -> list[KittiTrackingAnnotation] | None:
         if self._paths.label_dir is None:
@@ -197,38 +188,6 @@ class KittiTrackingDataset(Sequence[FrameData]):
         ]
 
     @staticmethod
-    def _parse_calibration(path: Path) -> Calibration:
-        if not path.is_file():
-            raise FileNotFoundError(f"calibration file not found: {path}")
-
-        matrices: dict[str, np.ndarray] = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
-            fields = line.replace(":", " ", 1).split()
-            if len(fields) < 2:
-                continue
-            matrices[fields[0]] = np.asarray(fields[1:], dtype=np.float32)
-
-        def matrix(*names: str, shape: tuple[int, int]) -> np.ndarray:
-            for name in names:
-                values = matrices.get(name)
-                if values is not None:
-                    if values.size != shape[0] * shape[1]:
-                        raise ValueError(f"invalid {name} matrix shape in {path}")
-                    return values.reshape(shape)
-            joined = ", ".join(names)
-            raise ValueError(f"missing calibration matrix ({joined}) in {path}")
-
-        return Calibration(
-            p0=matrix("P0", shape=(3, 4)),
-            p1=matrix("P1", shape=(3, 4)),
-            p2=matrix("P2", shape=(3, 4)),
-            p3=matrix("P3", shape=(3, 4)),
-            r0_rect=matrix("R0_rect", "R_rect", shape=(3, 3)),
-            tr_velo_to_cam=matrix("Tr_velo_to_cam", "Tr_velo_cam", "Tr_velo2cam", shape=(3, 4)),
-            tr_imu_to_velo=matrix("Tr_imu_to_velo", "Tr_imu_velo", shape=(3, 4)),
-        )
-
-    @staticmethod
     def _parse_annotations(path: Path) -> tuple[KittiTrackingAnnotation, ...]:
         if not path.is_file():
             raise FileNotFoundError(f"label file not found: {path}")
@@ -241,6 +200,12 @@ class KittiTrackingDataset(Sequence[FrameData]):
             if len(fields) < 17:
                 raise ValueError(f"invalid KITTI Tracking label at {path}:{line_number}")
 
+            bbox_2d = np.asarray(fields[6:10], dtype=np.float32)
+            dimensions = np.asarray((fields[12], fields[11], fields[10]), dtype=np.float32)
+            location = np.asarray(fields[13:16], dtype=np.float32)
+            if not np.isfinite(np.concatenate((bbox_2d, dimensions, location))).all():
+                raise ValueError(f"label contains NaN or Inf values at {path}:{line_number}")
+
             annotations.append(
                 KittiTrackingAnnotation(
                     frame_id=int(fields[0]),
@@ -249,9 +214,9 @@ class KittiTrackingDataset(Sequence[FrameData]):
                     truncation=float(fields[3]),
                     occlusion=int(fields[4]),
                     alpha=float(fields[5]),
-                    bbox_2d=np.asarray(fields[6:10], dtype=np.float32),
-                    dimensions=np.asarray((fields[12], fields[11], fields[10]), dtype=np.float32),
-                    location=np.asarray(fields[13:16], dtype=np.float32),
+                    bbox_2d=bbox_2d,
+                    dimensions=dimensions,
+                    location=location,
                     yaw=float(fields[16]),
                     score=float(fields[17]) if len(fields) > 17 else None,
                 )

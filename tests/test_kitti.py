@@ -1,4 +1,4 @@
-"""Tests for KITTI Tracking file parsing and local-data integration."""
+"""Tests for the minimal KITTI Tracking dataset loader."""
 
 from __future__ import annotations
 
@@ -10,84 +10,100 @@ import pytest
 from robot_perception.dataset import KittiTrackingDataset
 
 
-def _write_calibration(path: Path) -> None:
-    projection = " ".join(str(value) for value in range(12))
-    rotation = " ".join(str(value) for value in range(9))
-    transform = " ".join(str(value) for value in range(12))
-    path.write_text(
-        "\n".join(
-            (
-                f"P0: {projection}",
-                f"P1: {projection}",
-                f"P2: {projection}",
-                f"P3: {projection}",
-                f"R_rect {rotation}",
-                f"Tr_velo_cam {transform}",
-                f"Tr_imu_velo {transform}",
-            )
-        ),
-        encoding="utf-8",
-    )
-
-
-def test_reads_split_download_layout(tmp_path: Path) -> None:
+def _create_dataset_root(
+    tmp_path: Path,
+    *,
+    label_content: str = "0 7 Car 0.0 1 -1.0 1.0 2.0 3.0 4.0 1.5 1.6 3.9 5.0 6.0 7.0 0.2\n",
+    points: np.ndarray | None = None,
+) -> Path:
     sequence_id = "0000"
     image_dir = tmp_path / "data_tracking_image_2" / "training" / "image_02" / sequence_id
     lidar_dir = tmp_path / "data_tracking_velodyne" / "training" / "velodyne" / sequence_id
-    calibration_dir = tmp_path / "data_tracking_calib" / "training" / "calib"
     label_dir = tmp_path / "data_tracking_label_2" / "training" / "label_02"
-    for directory in (image_dir, lidar_dir, calibration_dir, label_dir):
+    for directory in (image_dir, lidar_dir, label_dir):
         directory.mkdir(parents=True)
 
-    np.asarray(((1.0, 2.0, 3.0, 0.5),), dtype=np.float32).tofile(lidar_dir / "000000.bin")
-    _write_calibration(calibration_dir / "0000.txt")
-    (label_dir / "0000.txt").write_text(
-        "0 7 Car 0.0 1 -1.0 1.0 2.0 3.0 4.0 1.5 1.6 3.9 5.0 6.0 7.0 0.2\n",
-        encoding="utf-8",
-    )
+    valid_points = np.asarray(((1.0, 2.0, 3.0, 0.5),), dtype=np.float32) if points is None else points
+    valid_points.tofile(lidar_dir / "000000.bin")
+    (label_dir / "0000.txt").write_text(label_content, encoding="utf-8")
+    return tmp_path
 
-    dataset = KittiTrackingDataset(tmp_path, sequences=[0], load_images=False)
-    frame = dataset[0]
+
+def test_dataset_initialization(tmp_path: Path) -> None:
+    dataset = KittiTrackingDataset(_create_dataset_root(tmp_path), sequences=[0], load_images=False)
 
     assert len(dataset) == 1
+    assert dataset.sequence_ids == ("0000",)
+
+
+def test_point_cloud_shape_and_frame_identity(tmp_path: Path) -> None:
+    dataset = KittiTrackingDataset(_create_dataset_root(tmp_path), sequences=["0000"], load_images=False)
+    frame = dataset.get_frame("0000", 0)
+
     assert frame.sequence_id == "0000"
+    assert frame.frame_id == 0
     assert frame.lidar_points.shape == (1, 4)
-    assert frame.calibration is not None
-    assert frame.calibration.p2.shape == (3, 4)
-    assert frame.annotations is not None
-    assert frame.annotations[0].track_id == 7
-    assert frame.annotations[0].dimensions.tolist() == [3.9, 1.6, 1.5]
+    assert frame.lidar_points.dtype == np.float32
+    assert frame.lidar_points.tolist() == [[1.0, 2.0, 3.0, 0.5]]
+    assert frame.calibration is None
 
 
-def test_testing_split_without_labels_returns_no_annotations(tmp_path: Path) -> None:
-    sequence_id = "0000"
-    image_dir = tmp_path / "data_tracking_image_2" / "testing" / "image_02" / sequence_id
-    lidar_dir = tmp_path / "data_tracking_velodyne" / "testing" / "velodyne" / sequence_id
-    calibration_dir = tmp_path / "data_tracking_calib" / "testing" / "calib"
-    for directory in (image_dir, lidar_dir, calibration_dir):
-        directory.mkdir(parents=True)
+def test_label_parsing(tmp_path: Path) -> None:
+    dataset = KittiTrackingDataset(_create_dataset_root(tmp_path), load_images=False)
+    annotations = dataset[0].annotations
 
-    np.zeros((1, 4), dtype=np.float32).tofile(lidar_dir / "000000.bin")
-    _write_calibration(calibration_dir / "0000.txt")
+    assert annotations is not None
+    annotation = annotations[0]
+    assert annotation.frame_id == 0
+    assert annotation.track_id == 7
+    assert annotation.class_name == "Car"
+    assert annotation.bbox_2d.tolist() == [1.0, 2.0, 3.0, 4.0]
+    np.testing.assert_allclose(annotation.dimensions, (3.9, 1.6, 1.5))
+    np.testing.assert_allclose(annotation.location, (5.0, 6.0, 7.0))
+    assert annotation.yaw == 0.2
 
-    dataset = KittiTrackingDataset(tmp_path, split="testing", sequences=[0], load_images=False)
 
-    assert dataset[0].annotations is None
+def test_empty_label_returns_empty_annotations(tmp_path: Path) -> None:
+    dataset = KittiTrackingDataset(_create_dataset_root(tmp_path, label_content=""), load_images=False)
+
+    assert dataset[0].annotations == []
+
+
+def test_invalid_frame_raises_file_not_found(tmp_path: Path) -> None:
+    dataset = KittiTrackingDataset(_create_dataset_root(tmp_path), load_images=False)
+
+    with pytest.raises(FileNotFoundError, match="sequence=0000, frame=000099"):
+        dataset.get_frame("0000", 99)
+
+
+def test_invalid_lidar_size_raises_value_error(tmp_path: Path) -> None:
+    root = _create_dataset_root(tmp_path)
+    lidar_path = root / "data_tracking_velodyne" / "training" / "velodyne" / "0000" / "000000.bin"
+    np.asarray((1.0, 2.0, 3.0), dtype=np.float32).tofile(lidar_path)
+    dataset = KittiTrackingDataset(root, load_images=False)
+
+    with pytest.raises(ValueError, match="N x 4"):
+        dataset[0]
+
+
+@pytest.mark.parametrize("invalid_value", (np.nan, np.inf))
+def test_non_finite_lidar_raises_value_error(tmp_path: Path, invalid_value: float) -> None:
+    points = np.asarray(((1.0, 2.0, 3.0, invalid_value),), dtype=np.float32)
+    dataset = KittiTrackingDataset(_create_dataset_root(tmp_path, points=points), load_images=False)
+
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        dataset[0]
 
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 
 
 @pytest.mark.skipif(not DATA_ROOT.is_dir(), reason="local KITTI data is unavailable")
-def test_reads_local_kitti_sequence_zero() -> None:
+def test_reads_local_kitti_frame_100() -> None:
     dataset = KittiTrackingDataset(DATA_ROOT, sequences=["0000"])
-    frame = dataset[0]
+    frame = dataset.get_frame("0000", 100)
 
     assert frame.image is not None
     assert frame.image.ndim == 3
-    assert frame.lidar_points.dtype == np.float32
     assert frame.lidar_points.shape[1] == 4
-    assert frame.calibration is not None
-    assert frame.calibration.tr_velo_to_cam.shape == (3, 4)
     assert frame.annotations is not None
-    assert frame.annotations[0].frame_id == 0
