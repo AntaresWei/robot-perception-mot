@@ -1,0 +1,461 @@
+diff --git a/scripts/project_lidar_to_image.py b/scripts/project_lidar_to_image.py
+new file mode 100644
+index 0000000..ec71740
+--- /dev/null
++++ b/scripts/project_lidar_to_image.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""Project one KITTI LiDAR frame onto its camera image."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++import numpy as np
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
++
++from robot_perception.common.geometry import lidar_to_image
++from robot_perception.dataset import KittiTrackingDataset
++from robot_perception.dataset.calibration import parse_kitti_calibration
++
++
++def _load_config(path: Path) -> dict[str, object]:
++    try:
++        import yaml
++    except ImportError as error:
++        raise RuntimeError("PyYAML is required to read the dataset configuration") from error
++    if not path.is_file():
++        raise FileNotFoundError(f"dataset config not found: {path}")
++    config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++    dataset_config = config.get("dataset")
++    if not isinstance(dataset_config, dict):
++        raise ValueError(f"missing dataset mapping in config: {path}")
++    return dataset_config
++
++
++def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
++    candidates = (
++        root / split / "calib" / f"{sequence_id}.txt",
++        root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
++    )
++    for candidate in candidates:
++        if candidate.is_file():
++            return candidate
++    raise FileNotFoundError(f"calibration file not found for sequence {sequence_id} under {root}")
++
++
++def _draw_projection(image: np.ndarray, pixels: np.ndarray) -> np.ndarray:
++    try:
++        import cv2
++    except ImportError as error:
++        raise RuntimeError("OpenCV is required for projection visualization") from error
++
++    output = image.copy()
++    for u, v in pixels.astype(np.int32):
++        cv2.circle(output, (int(u), int(v)), 1, (0, 255, 0), -1)
++    return output
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", type=Path, default=REPOSITORY_ROOT / "configs" / "dataset.yaml")
++    parser.add_argument("--root", type=Path, help="KITTI root; overrides dataset.root")
++    parser.add_argument("--split", choices=("training", "testing"), help="KITTI split; overrides config")
++    parser.add_argument("--sequence", required=True, help="KITTI sequence ID, for example 0000")
++    parser.add_argument("--frame", required=True, type=int, help="KITTI frame ID, for example 100")
++    parser.add_argument("--output", type=Path, help="Output image path")
++    args = parser.parse_args()
++
++    try:
++        dataset_config = _load_config(args.config)
++        root_value = args.root or dataset_config.get("root")
++        if root_value is None:
++            raise ValueError("provide --root or set dataset.root in the config")
++        root = Path(root_value)
++        if not root.is_absolute():
++            root = REPOSITORY_ROOT / root
++        split = args.split or str(dataset_config.get("split", "training"))
++        dataset = KittiTrackingDataset(
++            root,
++            split=split,
++            sequences=[args.sequence],
++            load_images=True,
++            load_annotations=False,
++        )
++        frame = dataset.get_frame(args.sequence, args.frame)
++        calibration = parse_kitti_calibration(_calibration_path(root, split, frame.sequence_id))
++        if frame.image is None:
++            raise ValueError("the projection demo requires an image")
++        pixels, _ = lidar_to_image(
++            frame.lidar_points,
++            calibration,
++            image_shape=frame.image.shape,
++            return_mask=True,
++        )
++        output_image = _draw_projection(frame.image, pixels)
++        output_path = args.output or (
++            REPOSITORY_ROOT / "outputs" / "visualizations" / f"kitti_{frame.sequence_id}_{frame.frame_id:06d}.png"
++        )
++        output_path.parent.mkdir(parents=True, exist_ok=True)
++        import cv2
++
++        if not cv2.imwrite(str(output_path), output_image):
++            raise OSError(f"failed to write visualization: {output_path}")
++    except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++
++    print(f"Saved projection visualization: {output_path}")
++    print(f"Projected points: {len(pixels)}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/robot_perception/common/geometry.py b/src/robot_perception/common/geometry.py
+new file mode 100644
+index 0000000..49fc7dc
+--- /dev/null
++++ b/src/robot_perception/common/geometry.py
+@@ -0,0 +1,136 @@
++"""Vectorized coordinate transforms used by the calibration task."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from typing import Any
++
++import numpy as np
++
++
++def _matrix_from_calibration(calibration: Any, name: str) -> np.ndarray:
++    if isinstance(calibration, Mapping):
++        value = calibration.get(name)
++    else:
++        value = getattr(calibration, name, None)
++    if value is None:
++        raise ValueError(f"calibration is missing {name}")
++    matrix = np.asarray(value, dtype=np.float64)
++    expected_shape = {"Tr_velo_to_cam": (3, 4), "R0_rect": (3, 3), "P2": (3, 4)}[name]
++    if matrix.shape != expected_shape:
++        raise ValueError(f"{name} must have shape {expected_shape}, got {matrix.shape}")
++    if not np.isfinite(matrix).all():
++        raise ValueError(f"{name} contains NaN or Inf values")
++    return matrix
++
++
++def _validate_points(points: np.ndarray) -> np.ndarray:
++    array = np.asarray(points)
++    if array.ndim != 2 or array.shape[1] not in (3, 4):
++        raise ValueError(f"points must have shape (N, 3) or (N, 4), got {array.shape}")
++    return array.astype(np.float64, copy=False)
++
++
++def _homogeneous(points: np.ndarray) -> np.ndarray:
++    return np.concatenate((points, np.ones((points.shape[0], 1), dtype=points.dtype)), axis=1)
++
++
++def lidar_to_camera(
++    points: np.ndarray,
++    calibration: Any,
++    *,
++    return_mask: bool = False,
++) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
++    """Transform LiDAR points to the unrectified camera frame.
++
++    Non-finite input points are discarded. The optional mask maps returned rows
++    back to the original input rows.
++    """
++
++    array = _validate_points(points)
++    finite_mask = np.isfinite(array).all(axis=1)
++    xyz = array[finite_mask, :3]
++    transform = _matrix_from_calibration(calibration, "Tr_velo_to_cam")
++    camera_points = _homogeneous(xyz) @ transform.T
++    if return_mask:
++        return camera_points, finite_mask
++    return camera_points
++
++
++def camera_to_image(
++    points: np.ndarray,
++    calibration: Any,
++    *,
++    image_shape: tuple[int, ...] | None = None,
++    return_mask: bool = False,
++) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
++    """Project camera-frame points into image pixels.
++
++    Rectification is applied before projection. Points with non-finite values,
++    non-positive rectified depth, or pixels outside ``image_shape`` are removed.
++    ``image_shape`` may be ``(height, width)`` or an image array shape.
++    """
++
++    array = _validate_points(points)
++    finite_mask = np.isfinite(array).all(axis=1)
++    camera_points = array[finite_mask, :3]
++    rectification = _matrix_from_calibration(calibration, "R0_rect")
++    projection = _matrix_from_calibration(calibration, "P2")
++
++    rectified_points = camera_points @ rectification.T
++    depths = rectified_points[:, 2]
++    positive_depth_mask = depths > 0.0
++    valid_points = rectified_points[positive_depth_mask]
++    valid_depths = depths[positive_depth_mask]
++    projected_homogeneous = _homogeneous(valid_points) @ projection.T
++    denominator = projected_homogeneous[:, 2]
++    valid_projection_mask = np.isfinite(denominator) & (denominator > 0.0)
++    projected_homogeneous = projected_homogeneous[valid_projection_mask]
++    valid_depths = valid_depths[valid_projection_mask]
++    pixels = projected_homogeneous[:, :2] / projected_homogeneous[:, 2:3]
++
++    if image_shape is not None:
++        if len(image_shape) < 2:
++            raise ValueError(f"image_shape must contain height and width, got {image_shape}")
++        height, width = image_shape[:2]
++        in_image = (
++            (pixels[:, 0] >= 0.0)
++            & (pixels[:, 0] < width)
++            & (pixels[:, 1] >= 0.0)
++            & (pixels[:, 1] < height)
++        )
++    else:
++        in_image = np.ones(pixels.shape[0], dtype=bool)
++
++    pixels = pixels[in_image]
++    # Build a mask in the caller's original point coordinate space.
++    valid_indices = np.flatnonzero(finite_mask)[positive_depth_mask][valid_projection_mask][in_image]
++    output_mask = np.zeros(array.shape[0], dtype=bool)
++    output_mask[valid_indices] = True
++    if return_mask:
++        return pixels, output_mask
++    return pixels
++
++
++def lidar_to_image(
++    points: np.ndarray,
++    calibration: Any,
++    *,
++    image_shape: tuple[int, ...] | None = None,
++    return_mask: bool = False,
++) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
++    """Transform LiDAR points through camera and rectified image coordinates."""
++
++    camera_points, finite_mask = lidar_to_camera(points, calibration, return_mask=True)
++    pixels, camera_mask = camera_to_image(
++        camera_points,
++        calibration,
++        image_shape=image_shape,
++        return_mask=True,
++    )
++    output_mask = np.zeros(len(np.asarray(points)), dtype=bool)
++    finite_indices = np.flatnonzero(finite_mask)
++    output_mask[finite_indices[camera_mask]] = True
++    if return_mask:
++        return pixels, output_mask
++    return pixels
+diff --git a/src/robot_perception/dataset/calibration.py b/src/robot_perception/dataset/calibration.py
+new file mode 100644
+index 0000000..bedc308
+--- /dev/null
++++ b/src/robot_perception/dataset/calibration.py
+@@ -0,0 +1,78 @@
++"""Minimal KITTI camera calibration parser."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++
++
++def _matrix(values: list[str], shape: tuple[int, int], name: str, path: Path) -> np.ndarray:
++    if len(values) != shape[0] * shape[1]:
++        raise ValueError(f"{name} in {path} must contain {shape[0] * shape[1]} values")
++    matrix = np.asarray(values, dtype=np.float64).reshape(shape)
++    if not np.isfinite(matrix).all():
++        raise ValueError(f"{name} in {path} contains NaN or Inf values")
++    return matrix
++
++
++@dataclass(frozen=True)
++class KittiCalibration:
++    """The matrices required for KITTI LiDAR-to-image projection."""
++
++    P2: np.ndarray
++    R0_rect: np.ndarray
++    Tr_velo_to_cam: np.ndarray
++
++    def __post_init__(self) -> None:
++        for name, value, shape in (
++            ("P2", self.P2, (3, 4)),
++            ("R0_rect", self.R0_rect, (3, 3)),
++            ("Tr_velo_to_cam", self.Tr_velo_to_cam, (3, 4)),
++        ):
++            matrix = np.asarray(value, dtype=np.float64)
++            if matrix.shape != shape:
++                raise ValueError(f"{name} must have shape {shape}, got {matrix.shape}")
++            if not np.isfinite(matrix).all():
++                raise ValueError(f"{name} contains NaN or Inf values")
++            object.__setattr__(self, name, matrix)
++
++
++# Short name for callers that use the generic calibration terminology.
++Calibration = KittiCalibration
++
++
++def parse_kitti_calibration(path: str | Path) -> KittiCalibration:
++    """Parse P2, R0_rect, and Tr_velo_to_cam from a KITTI calibration file."""
++
++    calibration_path = Path(path)
++    if not calibration_path.is_file():
++        raise FileNotFoundError(f"calibration file not found: {calibration_path}")
++
++    values_by_key: dict[str, list[str]] = {}
++    for line_number, line in enumerate(calibration_path.read_text(encoding="utf-8").splitlines(), start=1):
++        fields = line.replace(":", " ", 1).split()
++        if not fields:
++            continue
++        if len(fields) == 1:
++            raise ValueError(f"invalid calibration line at {calibration_path}:{line_number}")
++        values_by_key[fields[0]] = fields[1:]
++
++    def required(*keys: str) -> tuple[str, list[str]]:
++        for key in keys:
++            if key in values_by_key:
++                return key, values_by_key[key]
++        raise ValueError(f"missing calibration key ({', '.join(keys)}) in {calibration_path}")
++
++    p2_key, p2_values = required("P2")
++    rect_key, rect_values = required("R0_rect", "R_rect")
++    transform_key, transform_values = required("Tr_velo_to_cam", "Tr_velo_cam", "Tr_velo2cam")
++    return KittiCalibration(
++        P2=_matrix(p2_values, (3, 4), p2_key, calibration_path),
++        R0_rect=_matrix(rect_values, (3, 3), rect_key, calibration_path),
++        Tr_velo_to_cam=_matrix(transform_values, (3, 4), transform_key, calibration_path),
++    )
++
++
++load_calibration = parse_kitti_calibration
+diff --git a/tests/test_calibration.py b/tests/test_calibration.py
+new file mode 100644
+index 0000000..59cbe71
+--- /dev/null
++++ b/tests/test_calibration.py
+@@ -0,0 +1,111 @@
++"""Calibration parser and vectorized projection tests."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from robot_perception.common.geometry import camera_to_image, lidar_to_camera, lidar_to_image
++from robot_perception.dataset.calibration import KittiCalibration, parse_kitti_calibration
++
++
++def _calibration(
++    *,
++    p2: np.ndarray | None = None,
++    rectification: np.ndarray | None = None,
++    transform: np.ndarray | None = None,
++) -> KittiCalibration:
++    return KittiCalibration(
++        P2=np.eye(3, 4) if p2 is None else p2,
++        R0_rect=np.eye(3) if rectification is None else rectification,
++        Tr_velo_to_cam=np.hstack((np.eye(3), np.zeros((3, 1)))) if transform is None else transform,
++    )
++
++
++def _write_calibration(path: Path) -> None:
++    path.write_text(
++        "\n".join(
++            (
++                "P2: " + " ".join(str(value) for value in range(12)),
++                "R0_rect: " + " ".join(str(value) for value in range(9)),
++                "Tr_velo_to_cam: " + " ".join(str(value) for value in range(12)),
++            )
++        ),
++        encoding="utf-8",
++    )
++
++
++def test_calibration_parser_reads_required_matrices(tmp_path: Path) -> None:
++    path = tmp_path / "0000.txt"
++    _write_calibration(path)
++
++    calibration = parse_kitti_calibration(path)
++
++    assert calibration.P2.shape == (3, 4)
++    assert calibration.R0_rect.shape == (3, 3)
++    assert calibration.Tr_velo_to_cam.shape == (3, 4)
++
++
++def test_identity_transform() -> None:
++    points = np.asarray(((1.0, 2.0, 4.0), (2.0, -1.0, 2.0)))
++
++    result = lidar_to_camera(points, _calibration())
++
++    np.testing.assert_allclose(result, points)
++
++
++def test_known_transform_uses_homogeneous_translation() -> None:
++    transform = np.hstack((np.eye(3), np.asarray(((10.0,), (20.0,), (30.0,)))))
++    points = np.asarray(((1.0, 2.0, 3.0),))
++
++    result = lidar_to_camera(points, _calibration(transform=transform))
++
++    np.testing.assert_allclose(result, ((11.0, 22.0, 33.0),))
++
++
++def test_homogeneous_projection() -> None:
++    p2 = np.asarray(((2.0, 0.0, 10.0, 0.0), (0.0, 3.0, 20.0, 0.0), (0.0, 0.0, 1.0, 0.0)))
++
++    result = camera_to_image(np.asarray(((1.0, 2.0, 4.0),)), _calibration(p2=p2))
++
++    np.testing.assert_allclose(result, ((10.5, 21.5),))
++
++
++def test_points_behind_camera_are_filtered() -> None:
++    points = np.asarray(((1.0, 2.0, 4.0), (1.0, 2.0, 0.0), (1.0, 2.0, -1.0)))
++
++    pixels, mask = camera_to_image(points, _calibration(), return_mask=True)
++
++    np.testing.assert_allclose(pixels, ((0.25, 0.5),))
++    assert mask.tolist() == [True, False, False]
++
++
++def test_image_boundary_is_half_open() -> None:
++    points = np.asarray(((0.0, 0.0, 1.0), (19.0, 9.0, 1.0), (20.0, 9.0, 1.0), (-1.0, 0.0, 1.0)))
++
++    pixels, mask = camera_to_image(points, _calibration(), image_shape=(10, 20), return_mask=True)
++
++    np.testing.assert_allclose(pixels, ((0.0, 0.0), (19.0, 9.0)))
++    assert mask.tolist() == [True, True, False, False]
++
++
++def test_invalid_points_are_filtered_by_lidar_to_image() -> None:
++    points = np.asarray(((1.0, 2.0, 4.0, 0.5), (np.nan, 0.0, 1.0, 0.2)))
++
++    pixels, mask = lidar_to_image(points, _calibration(), return_mask=True)
++
++    np.testing.assert_allclose(pixels, ((0.25, 0.5),))
++    assert mask.tolist() == [True, False]
++
++
++@pytest.mark.parametrize("points", (np.zeros(3), np.zeros((2, 2)), np.zeros((2, 5))))
++def test_invalid_input_shape(points: np.ndarray) -> None:
++    with pytest.raises(ValueError, match="shape"):
++        lidar_to_camera(points, _calibration())
++
++
++def test_invalid_calibration_shape() -> None:
++    with pytest.raises(ValueError, match="P2"):
++        KittiCalibration(P2=np.eye(3), R0_rect=np.eye(3), Tr_velo_to_cam=np.eye(3, 4))

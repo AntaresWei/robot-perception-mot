@@ -1,0 +1,17 @@
+# 变更清单
+
+基线 `da7bfde5d30c31905913d9ec08fb4e3ae8eb01d4` → 当前工作区 ｜ 4 个文件，+437 / -0
+
+```
+112	0	scripts/project_lidar_to_image.py
+136	0	src/robot_perception/common/geometry.py
+78	0	src/robot_perception/dataset/calibration.py
+111	0	tests/test_calibration.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- scripts/project_lidar_to_image.py
+- src/robot_perception/common/geometry.py
+- src/robot_perception/dataset/calibration.py
+- tests/test_calibration.py
