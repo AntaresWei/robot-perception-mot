@@ -10,9 +10,16 @@ pointcloud:
     y_max: 40.0
     z_min: -3.0
     z_max: 2.0
+  outlier_filter:
+    method: statistical
+    nb_neighbors: 20
+    std_ratio: 2.0
+    radius: 0.80
+    min_neighbors: 5
 
 ground:
   method: ransac
   distance_threshold: 0.15
   ransac_n: 3
   num_iterations: 100
+  random_seed: 0

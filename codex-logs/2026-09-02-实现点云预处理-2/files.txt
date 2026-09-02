@@ -1,0 +1,19 @@
+# 变更清单
+
+基线 `3daf42797d5a7bb900607dfcb977a9bbd99cdb1c` → 当前工作区 ｜ 6 个文件，+493 / -1
+
+```
+7	0	configs/pipeline.yaml
+91	0	scripts/run_pointcloud_preprocess.py
+26	1	src/robot_perception/pointcloud/__init__.py
+92	0	src/robot_perception/pointcloud/ground.py
+192	0	src/robot_perception/pointcloud/preprocess.py
+85	0	tests/test_pointcloud.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- scripts/run_pointcloud_preprocess.py
+- src/robot_perception/pointcloud/ground.py
+- src/robot_perception/pointcloud/preprocess.py
+- tests/test_pointcloud.py

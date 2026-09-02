@@ -1,0 +1,537 @@
+diff --git a/configs/pipeline.yaml b/configs/pipeline.yaml
+index b6f2ac1..cf4fe47 100644
+--- a/configs/pipeline.yaml
++++ b/configs/pipeline.yaml
+@@ -10,9 +10,16 @@ pointcloud:
+     y_max: 40.0
+     z_min: -3.0
+     z_max: 2.0
++  outlier_filter:
++    method: statistical
++    nb_neighbors: 20
++    std_ratio: 2.0
++    radius: 0.80
++    min_neighbors: 5
+ 
+ ground:
+   method: ransac
+   distance_threshold: 0.15
+   ransac_n: 3
+   num_iterations: 100
++  random_seed: 0
+diff --git a/scripts/run_pointcloud_preprocess.py b/scripts/run_pointcloud_preprocess.py
+new file mode 100644
+index 0000000..53604c7
+--- /dev/null
++++ b/scripts/run_pointcloud_preprocess.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""Run the configured LiDAR preprocessing pipeline for one KITTI frame."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++from time import perf_counter
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
++
++from robot_perception.dataset import KittiTrackingDataset
++from robot_perception.pointcloud import preprocess_point_cloud
++
++
++def _load_yaml(path: Path) -> dict[str, object]:
++    try:
++        import yaml
++    except ImportError as error:
++        raise RuntimeError("PyYAML is required to read configuration files") from error
++    if not path.is_file():
++        raise FileNotFoundError(f"configuration file not found: {path}")
++    content = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++    if not isinstance(content, dict):
++        raise ValueError(f"configuration must be a mapping: {path}")
++    return content
++
++
++def _resolve_path(path_value: str | Path) -> Path:
++    path = Path(path_value)
++    return path if path.is_absolute() else REPOSITORY_ROOT / path
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", type=Path, default=REPOSITORY_ROOT / "configs" / "pipeline.yaml")
++    parser.add_argument("--dataset-config", type=Path, help="Dataset YAML; overrides pipeline.dataset_config")
++    parser.add_argument("--root", type=Path, help="KITTI root; overrides dataset.root")
++    parser.add_argument("--split", choices=("training", "testing"), help="KITTI split; overrides dataset config")
++    parser.add_argument("--sequence", required=True, help="KITTI sequence ID, for example 0000")
++    parser.add_argument("--frame", required=True, type=int, help="KITTI frame ID, for example 100")
++    args = parser.parse_args()
++
++    try:
++        pipeline_config = _load_yaml(args.config)
++        dataset_config_path = args.dataset_config or _resolve_path(str(pipeline_config["dataset_config"]))
++        dataset_config = _load_yaml(dataset_config_path).get("dataset")
++        if not isinstance(dataset_config, dict):
++            raise ValueError(f"missing dataset mapping in {dataset_config_path}")
++        root_value = args.root or dataset_config.get("root")
++        if root_value is None:
++            raise ValueError("provide --root or set dataset.root in the dataset config")
++        dataset = KittiTrackingDataset(
++            _resolve_path(root_value),
++            split=args.split or str(dataset_config.get("split", "training")),
++            sequences=[args.sequence],
++            load_images=False,
++            load_annotations=False,
++        )
++        frame = dataset.get_frame(args.sequence, args.frame)
++        pointcloud_config = pipeline_config.get("pointcloud")
++        ground_config = pipeline_config.get("ground")
++        if not isinstance(pointcloud_config, dict) or not isinstance(ground_config, dict):
++            raise ValueError("pipeline config requires pointcloud and ground mappings")
++        start = perf_counter()
++        result = preprocess_point_cloud(
++            frame.lidar_points,
++            pointcloud_config=pointcloud_config,
++            ground_config=ground_config,
++        )
++        latency_ms = (perf_counter() - start) * 1000.0
++    except (FileNotFoundError, RuntimeError, ValueError, KeyError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++
++    print(f"Sequence: {frame.sequence_id}")
++    print(f"Frame: {frame.frame_id}")
++    print(f"Raw point count: {len(result.raw_points)}")
++    print(f"Filtered point count: {len(result.outlier_filtered_points)}")
++    print(f"Ground point count: {len(result.ground_points)}")
++    print(f"Non-ground point count: {len(result.non_ground_points)}")
++    print(f"Processing latency: {latency_ms:.2f} ms")
++    print(f"Stage shapes: {result.stage_shapes}")
++    print(f"Plane model: {result.plane_model}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/robot_perception/pointcloud/__init__.py b/src/robot_perception/pointcloud/__init__.py
+index ee1aee7..e06d4d8 100644
+--- a/src/robot_perception/pointcloud/__init__.py
++++ b/src/robot_perception/pointcloud/__init__.py
+@@ -1 +1,26 @@
+-"""Point cloud package namespace; processing is not implemented yet."""
++"""Point cloud preprocessing and ground segmentation."""
++
++from robot_perception.pointcloud.ground import GroundSegmentationResult, segment_ground_ransac
++from robot_perception.pointcloud.preprocess import (
++    PointCloudPreprocessResult,
++    crop_roi,
++    filter_outliers,
++    preprocess_point_cloud,
++    radius_outlier_filter,
++    remove_invalid_points,
++    statistical_outlier_filter,
++    voxel_downsample,
++)
++
++__all__ = [
++    "GroundSegmentationResult",
++    "PointCloudPreprocessResult",
++    "crop_roi",
++    "filter_outliers",
++    "preprocess_point_cloud",
++    "radius_outlier_filter",
++    "remove_invalid_points",
++    "segment_ground_ransac",
++    "statistical_outlier_filter",
++    "voxel_downsample",
++]
+diff --git a/src/robot_perception/pointcloud/ground.py b/src/robot_perception/pointcloud/ground.py
+new file mode 100644
+index 0000000..b400c87
+--- /dev/null
++++ b/src/robot_perception/pointcloud/ground.py
+@@ -0,0 +1,92 @@
++"""RANSAC ground-plane segmentation for LiDAR point clouds."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import numpy as np
++
++
++@dataclass(frozen=True)
++class GroundSegmentationResult:
++    """Ground segmentation output with a normalized plane ``[a, b, c, d]``."""
++
++    ground_points: np.ndarray
++    non_ground_points: np.ndarray
++    plane_model: np.ndarray | None
++
++
++def _fit_plane(points_xyz: np.ndarray) -> np.ndarray | None:
++    centered = points_xyz - points_xyz.mean(axis=0)
++    _, singular_values, right_vectors = np.linalg.svd(centered, full_matrices=False)
++    if singular_values.size < 3 or singular_values[-2] <= np.finfo(float).eps:
++        return None
++    normal = right_vectors[-1]
++    normal_norm = np.linalg.norm(normal)
++    if normal_norm <= np.finfo(float).eps:
++        return None
++    normal = normal / normal_norm
++    return np.concatenate((normal, (-normal @ points_xyz.mean(axis=0),)))
++
++
++def segment_ground_ransac(
++    points: np.ndarray,
++    *,
++    distance_threshold: float,
++    ransac_n: int,
++    num_iterations: int,
++    random_seed: int | None = None,
++) -> GroundSegmentationResult:
++    """Split a finite point cloud into plane inliers and non-ground points.
++
++    The plane model uses the normalized equation ``ax + by + cz + d = 0``.
++    Empty clouds and clouds with fewer than ``ransac_n`` points return all
++    points as non-ground and use ``None`` as the plane model.
++    """
++
++    cloud = np.asarray(points)
++    if cloud.ndim != 2 or cloud.shape[1] < 3:
++        raise ValueError(f"points must have shape (N, C) with C >= 3, got {cloud.shape}")
++    if not np.isfinite(cloud).all():
++        raise ValueError("ground segmentation requires finite point values")
++    if distance_threshold < 0.0:
++        raise ValueError("distance_threshold must be non-negative")
++    if ransac_n < 3:
++        raise ValueError("ransac_n must be at least 3")
++    if num_iterations < 1:
++        raise ValueError("num_iterations must be at least 1")
++    if len(cloud) < ransac_n:
++        return GroundSegmentationResult(cloud[:0].copy(), cloud.copy(), None)
++
++    xyz = cloud[:, :3].astype(np.float64, copy=False)
++    generator = np.random.default_rng(random_seed)
++    best_mask: np.ndarray | None = None
++    best_count = 0
++    best_error = np.inf
++
++    for _ in range(num_iterations):
++        sample = xyz[generator.choice(len(xyz), size=ransac_n, replace=False)]
++        plane = _fit_plane(sample)
++        if plane is None:
++            continue
++        distances = np.abs(xyz @ plane[:3] + plane[3])
++        inlier_mask = distances <= distance_threshold
++        inlier_count = int(inlier_mask.sum())
++        mean_error = float(distances[inlier_mask].mean()) if inlier_count else np.inf
++        if inlier_count > best_count or (inlier_count == best_count and mean_error < best_error):
++            best_mask = inlier_mask
++            best_count = inlier_count
++            best_error = mean_error
++
++    if best_mask is None or best_count < ransac_n:
++        return GroundSegmentationResult(cloud[:0].copy(), cloud.copy(), None)
++
++    refined_plane = _fit_plane(xyz[best_mask])
++    if refined_plane is None:
++        return GroundSegmentationResult(cloud[:0].copy(), cloud.copy(), None)
++    refined_mask = np.abs(xyz @ refined_plane[:3] + refined_plane[3]) <= distance_threshold
++    return GroundSegmentationResult(
++        ground_points=cloud[refined_mask].copy(),
++        non_ground_points=cloud[~refined_mask].copy(),
++        plane_model=refined_plane,
++    )
+diff --git a/src/robot_perception/pointcloud/preprocess.py b/src/robot_perception/pointcloud/preprocess.py
+new file mode 100644
+index 0000000..73dbf8e
+--- /dev/null
++++ b/src/robot_perception/pointcloud/preprocess.py
+@@ -0,0 +1,192 @@
++"""Configurable LiDAR preprocessing stages."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass
++from typing import Any
++
++import numpy as np
++from scipy.spatial import cKDTree
++
++from robot_perception.pointcloud.ground import GroundSegmentationResult, segment_ground_ransac
++
++
++@dataclass(frozen=True)
++class PointCloudPreprocessResult:
++    """Intermediate and final point clouds retained for shape and count reporting."""
++
++    raw_points: np.ndarray
++    valid_points: np.ndarray
++    roi_points: np.ndarray
++    voxel_points: np.ndarray
++    outlier_filtered_points: np.ndarray
++    ground_points: np.ndarray
++    non_ground_points: np.ndarray
++    plane_model: np.ndarray | None
++
++    @property
++    def stage_shapes(self) -> dict[str, tuple[int, int]]:
++        """Shapes of the raw and every processed point cloud stage."""
++
++        return {
++            "raw": self.raw_points.shape,
++            "valid": self.valid_points.shape,
++            "roi": self.roi_points.shape,
++            "voxel": self.voxel_points.shape,
++            "outlier_filtered": self.outlier_filtered_points.shape,
++            "ground": self.ground_points.shape,
++            "non_ground": self.non_ground_points.shape,
++        }
++
++
++def _validate_point_cloud(points: np.ndarray) -> np.ndarray:
++    cloud = np.asarray(points)
++    if cloud.ndim != 2 or cloud.shape[1] < 3:
++        raise ValueError(f"points must have shape (N, C) with C >= 3, got {cloud.shape}")
++    if not np.issubdtype(cloud.dtype, np.number):
++        raise ValueError("points must use a numeric dtype")
++    return cloud
++
++
++def remove_invalid_points(points: np.ndarray) -> np.ndarray:
++    """Drop rows containing NaN or Inf while preserving all point attributes."""
++
++    cloud = _validate_point_cloud(points)
++    return cloud[np.isfinite(cloud).all(axis=1)].copy()
++
++
++def crop_roi(
++    points: np.ndarray,
++    *,
++    x_min: float,
++    x_max: float,
++    y_min: float,
++    y_max: float,
++    z_min: float,
++    z_max: float,
++) -> np.ndarray:
++    """Keep finite points inside the inclusive axis-aligned ROI."""
++
++    cloud = _validate_point_cloud(points)
++    if x_min > x_max or y_min > y_max or z_min > z_max:
++        raise ValueError("each ROI minimum must be less than or equal to its maximum")
++    xyz = cloud[:, :3]
++    mask = (
++        np.isfinite(xyz).all(axis=1)
++        & (xyz[:, 0] >= x_min)
++        & (xyz[:, 0] <= x_max)
++        & (xyz[:, 1] >= y_min)
++        & (xyz[:, 1] <= y_max)
++        & (xyz[:, 2] >= z_min)
++        & (xyz[:, 2] <= z_max)
++    )
++    return cloud[mask].copy()
++
++
++def voxel_downsample(points: np.ndarray, *, voxel_size: float) -> np.ndarray:
++    """Average points sharing a voxel while preserving all input columns."""
++
++    cloud = _validate_point_cloud(points)
++    if voxel_size <= 0.0:
++        raise ValueError("voxel_size must be positive")
++    if len(cloud) == 0:
++        return cloud.copy()
++    if not np.isfinite(cloud).all():
++        raise ValueError("voxel downsampling requires finite point values")
++
++    voxel_indices = np.floor(cloud[:, :3] / voxel_size).astype(np.int64)
++    _, inverse, counts = np.unique(voxel_indices, axis=0, return_inverse=True, return_counts=True)
++    accumulators = np.zeros((len(counts), cloud.shape[1]), dtype=np.result_type(cloud.dtype, np.float32))
++    np.add.at(accumulators, inverse, cloud)
++    return accumulators / counts[:, None]
++
++
++def statistical_outlier_filter(points: np.ndarray, *, nb_neighbors: int, std_ratio: float) -> np.ndarray:
++    """Remove points whose mean neighbor distance exceeds a statistical threshold."""
++
++    cloud = _validate_point_cloud(points)
++    if nb_neighbors < 1:
++        raise ValueError("nb_neighbors must be at least 1")
++    if std_ratio < 0.0:
++        raise ValueError("std_ratio must be non-negative")
++    if len(cloud) <= 2:
++        return cloud.copy()
++    if not np.isfinite(cloud).all():
++        raise ValueError("outlier filtering requires finite point values")
++
++    neighbor_count = min(nb_neighbors + 1, len(cloud))
++    distances, _ = cKDTree(cloud[:, :3]).query(cloud[:, :3], k=neighbor_count)
++    mean_distances = distances[:, 1:].mean(axis=1)
++    threshold = mean_distances.mean() + std_ratio * mean_distances.std()
++    return cloud[mean_distances <= threshold].copy()
++
++
++def radius_outlier_filter(points: np.ndarray, *, radius: float, min_neighbors: int) -> np.ndarray:
++    """Keep points having at least ``min_neighbors`` other points within ``radius``."""
++
++    cloud = _validate_point_cloud(points)
++    if radius <= 0.0:
++        raise ValueError("radius must be positive")
++    if min_neighbors < 0:
++        raise ValueError("min_neighbors must be non-negative")
++    if len(cloud) == 0 or min_neighbors == 0:
++        return cloud.copy()
++    if not np.isfinite(cloud).all():
++        raise ValueError("outlier filtering requires finite point values")
++
++    counts = cKDTree(cloud[:, :3]).query_ball_point(cloud[:, :3], radius, return_length=True)
++    return cloud[(counts - 1) >= min_neighbors].copy()
++
++
++def filter_outliers(points: np.ndarray, config: Mapping[str, Any]) -> np.ndarray:
++    """Apply the configured statistical or radius outlier filter."""
++
++    method = config.get("method", "statistical")
++    if method == "statistical":
++        return statistical_outlier_filter(
++            points,
++            nb_neighbors=int(config["nb_neighbors"]),
++            std_ratio=float(config["std_ratio"]),
++        )
++    if method == "radius":
++        return radius_outlier_filter(
++            points,
++            radius=float(config["radius"]),
++            min_neighbors=int(config["min_neighbors"]),
++        )
++    raise ValueError(f"unsupported outlier filter method: {method!r}")
++
++
++def preprocess_point_cloud(
++    points: np.ndarray,
++    *,
++    pointcloud_config: Mapping[str, Any],
++    ground_config: Mapping[str, Any],
++) -> PointCloudPreprocessResult:
++    """Run invalid removal, ROI, voxel, outlier, and RANSAC ground stages."""
++
++    if ground_config.get("method") != "ransac":
++        raise ValueError(f"unsupported ground segmentation method: {ground_config.get('method')!r}")
++    raw_points = _validate_point_cloud(points).copy()
++    valid_points = remove_invalid_points(raw_points)
++    roi_points = crop_roi(valid_points, **pointcloud_config["roi"])
++    voxel_points = voxel_downsample(roi_points, voxel_size=float(pointcloud_config["voxel_size"]))
++    outlier_points = filter_outliers(voxel_points, pointcloud_config["outlier_filter"])
++    segmentation: GroundSegmentationResult = segment_ground_ransac(
++        outlier_points,
++        distance_threshold=float(ground_config["distance_threshold"]),
++        ransac_n=int(ground_config["ransac_n"]),
++        num_iterations=int(ground_config["num_iterations"]),
++        random_seed=ground_config.get("random_seed"),
++    )
++    return PointCloudPreprocessResult(
++        raw_points=raw_points,
++        valid_points=valid_points,
++        roi_points=roi_points,
++        voxel_points=voxel_points,
++        outlier_filtered_points=outlier_points,
++        ground_points=segmentation.ground_points,
++        non_ground_points=segmentation.non_ground_points,
++        plane_model=segmentation.plane_model,
++    )
+diff --git a/tests/test_pointcloud.py b/tests/test_pointcloud.py
+new file mode 100644
+index 0000000..2c61925
+--- /dev/null
++++ b/tests/test_pointcloud.py
+@@ -0,0 +1,85 @@
++"""Tests for the LiDAR preprocessing pipeline."""
++
++from __future__ import annotations
++
++import numpy as np
++
++from robot_perception.pointcloud import (
++    crop_roi,
++    preprocess_point_cloud,
++    radius_outlier_filter,
++    remove_invalid_points,
++    segment_ground_ransac,
++    statistical_outlier_filter,
++    voxel_downsample,
++)
++
++
++def test_remove_invalid_points() -> None:
++    points = np.asarray(((1.0, 2.0, 3.0, 0.1), (np.nan, 0.0, 0.0, 0.2), (0.0, 0.0, np.inf, 0.3)))
++
++    result = remove_invalid_points(points)
++
++    np.testing.assert_allclose(result, ((1.0, 2.0, 3.0, 0.1),))
++
++
++def test_crop_roi_keeps_inclusive_boundaries() -> None:
++    points = np.asarray(((-1.0, 0.0, 0.0, 0.0), (0.0, -2.0, -3.0, 0.1), (1.0, 2.0, 3.0, 0.2), (1.1, 0.0, 0.0, 0.3)))
++
++    result = crop_roi(points, x_min=0.0, x_max=1.0, y_min=-2.0, y_max=2.0, z_min=-3.0, z_max=3.0)
++
++    np.testing.assert_allclose(result, ((0.0, -2.0, -3.0, 0.1), (1.0, 2.0, 3.0, 0.2)))
++
++
++def test_voxel_downsample_averages_points_and_intensity() -> None:
++    points = np.asarray(((0.01, 0.01, 0.01, 0.2), (0.09, 0.09, 0.09, 0.6), (0.20, 0.0, 0.0, 1.0)))
++
++    result = voxel_downsample(points, voxel_size=0.1)
++
++    np.testing.assert_allclose(result, ((0.05, 0.05, 0.05, 0.4), (0.2, 0.0, 0.0, 1.0)))
++
++
++def test_statistical_and_radius_outlier_filters_remove_isolated_point() -> None:
++    cluster = np.asarray(((0.0, 0.0, 0.0, 0.1), (0.1, 0.0, 0.0, 0.1), (0.0, 0.1, 0.0, 0.1), (0.1, 0.1, 0.0, 0.1)))
++    points = np.vstack((cluster, ((10.0, 10.0, 10.0, 0.1),)))
++
++    statistical = statistical_outlier_filter(points, nb_neighbors=2, std_ratio=1.0)
++    radius = radius_outlier_filter(points, radius=0.2, min_neighbors=2)
++
++    assert len(statistical) == len(cluster)
++    assert len(radius) == len(cluster)
++
++
++def test_ransac_ground_segmentation_on_synthetic_plane() -> None:
++    grid_x, grid_y = np.meshgrid(np.arange(-2, 3), np.arange(-2, 3))
++    ground = np.column_stack((grid_x.ravel(), grid_y.ravel(), np.zeros(grid_x.size), np.ones(grid_x.size)))
++    obstacles = np.asarray(((0.0, 0.0, 1.0, 0.5), (1.0, 1.0, 1.5, 0.5), (-1.0, 1.0, 2.0, 0.5)))
++    points = np.vstack((ground, obstacles))
++
++    result = segment_ground_ransac(
++        points,
++        distance_threshold=0.01,
++        ransac_n=3,
++        num_iterations=100,
++        random_seed=0,
++    )
++
++    assert result.plane_model is not None
++    assert len(result.ground_points) == len(ground)
++    assert len(result.non_ground_points) == len(obstacles)
++    assert abs(result.plane_model[2]) == 1.0
++    assert abs(result.plane_model[3]) < 1e-12
++
++
++def test_empty_input_is_safe_for_the_full_pipeline() -> None:
++    pointcloud_config = {
++        "voxel_size": 0.1,
++        "roi": {"x_min": 0.0, "x_max": 70.0, "y_min": -40.0, "y_max": 40.0, "z_min": -3.0, "z_max": 2.0},
++        "outlier_filter": {"method": "statistical", "nb_neighbors": 20, "std_ratio": 2.0, "radius": 0.8, "min_neighbors": 5},
++    }
++    ground_config = {"method": "ransac", "distance_threshold": 0.15, "ransac_n": 3, "num_iterations": 100, "random_seed": 0}
++
++    result = preprocess_point_cloud(np.empty((0, 4), dtype=np.float32), pointcloud_config=pointcloud_config, ground_config=ground_config)
++
++    assert result.plane_model is None
++    assert all(shape == (0, 4) for shape in result.stage_shapes.values())
