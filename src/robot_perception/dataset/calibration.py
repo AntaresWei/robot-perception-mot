@@ -9,6 +9,7 @@ import numpy as np
 
 
 def _matrix(values: list[str], shape: tuple[int, int], name: str, path: Path) -> np.ndarray:
+    # 先校验元素数量，再 reshape，避免格式错误被 NumPy 静默解释成错误矩阵。
     if len(values) != shape[0] * shape[1]:
         raise ValueError(f"{name} in {path} must contain {shape[0] * shape[1]} values")
     matrix = np.asarray(values, dtype=np.float64).reshape(shape)
@@ -52,6 +53,7 @@ def parse_kitti_calibration(path: str | Path) -> KittiCalibration:
 
     values_by_key: dict[str, list[str]] = {}
     for line_number, line in enumerate(calibration_path.read_text(encoding="utf-8").splitlines(), start=1):
+        # KITTI 文件既有 ``P2: ...`` 也有 ``P2 ...``，统一去掉首个冒号。
         fields = line.replace(":", " ", 1).split()
         if not fields:
             continue
@@ -66,6 +68,7 @@ def parse_kitti_calibration(path: str | Path) -> KittiCalibration:
         raise ValueError(f"missing calibration key ({', '.join(keys)}) in {calibration_path}")
 
     p2_key, p2_values = required("P2")
+    # 不依赖固定行号，只按键名读取，兼容不同 KITTI 发行版本的行顺序。
     rect_key, rect_values = required("R0_rect", "R_rect")
     transform_key, transform_values = required("Tr_velo_to_cam", "Tr_velo_cam", "Tr_velo2cam")
     return KittiCalibration(

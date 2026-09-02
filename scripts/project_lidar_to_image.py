@@ -32,6 +32,7 @@ def _load_config(path: Path) -> dict[str, object]:
 
 
 def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
+    # 数据集 Loader 支持两种目录布局，这里对 calibration 使用同样的查找规则。
     candidates = (
         root / split / "calib" / f"{sequence_id}.txt",
         root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
@@ -48,6 +49,7 @@ def _draw_projection(image: np.ndarray, pixels: np.ndarray) -> np.ndarray:
     except ImportError as error:
         raise RuntimeError("OpenCV is required for projection visualization") from error
 
+    # 坐标变换已在 geometry 中向量化；OpenCV 的 circle API 只能逐点绘制。
     output = image.copy()
     for u, v in pixels.astype(np.int32):
         cv2.circle(output, (int(u), int(v)), 1, (0, 255, 0), -1)

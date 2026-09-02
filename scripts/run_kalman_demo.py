@@ -30,6 +30,7 @@ def _load_config(path: Path) -> dict[str, object]:
 
 
 def _diagonal(config: object, size: int, name: str) -> np.ndarray:
+    # YAML 用 diagonal 表达协方差，交给 KF 后统一转换为方阵。
     if not isinstance(config, dict) or "diagonal" not in config:
         raise ValueError(f"{name} must contain a diagonal list")
     values = np.asarray(config["diagonal"], dtype=np.float64)
@@ -63,6 +64,7 @@ def main() -> int:
 
         steps = np.arange(num_steps, dtype=np.float64)
         truth = initial_position + steps[:, None] * dt * velocity
+        # 合成观测只在 truth 上加入高斯噪声，用于比较滤波前后的定位误差。
         rng = np.random.default_rng(int(trajectory["seed"]))
         measurements = truth + rng.normal(0.0, measurement_std, size=truth.shape)
         measurement_noise = np.square(measurement_std)

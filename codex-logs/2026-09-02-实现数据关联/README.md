@@ -68,7 +68,7 @@ conda run -n robot-perception-mot python -B -c "... associate_detections_to_trac
 
 ---
 
-## 4. 我学到了什么（面试可复述）
+## 4. 我学到了什么
 
 1. **技术点**：Mahalanobis distance 的关键不是公式本身，而是正确构造
    `S = HPH.T + R` 并用线性求解替代 `inv(S)`。

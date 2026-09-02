@@ -29,6 +29,7 @@ def _load_yaml(path: Path) -> dict[str, object]:
 
 
 def _resolve_path(path_value: str | Path) -> Path:
+    # 配置文件允许相对仓库根目录的路径，便于换机器运行而不写绝对路径。
     path = Path(path_value)
     return path if path.is_absolute() else REPOSITORY_ROOT / path
 
@@ -65,6 +66,7 @@ def main() -> int:
         if not isinstance(pointcloud_config, dict) or not isinstance(ground_config, dict):
             raise ValueError("pipeline config requires pointcloud and ground mappings")
         start = perf_counter()
+        # 计时只覆盖算法流水线，不包含数据读取和 YAML 解析。
         result = preprocess_point_cloud(
             frame.lidar_points,
             pointcloud_config=pointcloud_config,

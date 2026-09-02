@@ -66,6 +66,7 @@ class KittiTrackingDataset(Sequence[FrameData]):
             )
 
         self.sequence_ids = tuple(requested_sequences)
+        # 以 LiDAR 文件为帧索引基准，避免图像或标签缺帧时产生虚假的 frame。
         self._frame_keys = tuple(
             _FrameKey(sequence_id=sequence_id, frame_id=int(path.stem))
             for sequence_id in self.sequence_ids
@@ -79,6 +80,7 @@ class KittiTrackingDataset(Sequence[FrameData]):
 
     @staticmethod
     def _resolve_paths(root: Path, split: str) -> _DatasetPaths:
+        # 优先识别标准 KITTI 根目录；本项目本地数据则是四个压缩包拆开的布局。
         standard_root = root / split
         standard_label_dir = standard_root / "label_02"
         standard_paths = _DatasetPaths(
@@ -201,6 +203,7 @@ class KittiTrackingDataset(Sequence[FrameData]):
                 raise ValueError(f"invalid KITTI Tracking label at {path}:{line_number}")
 
             bbox_2d = np.asarray(fields[6:10], dtype=np.float32)
+            # KITTI 标签字段是 h,w,l；项目数据类统一保存为 l,w,h。
             dimensions = np.asarray((fields[12], fields[11], fields[10]), dtype=np.float32)
             location = np.asarray(fields[13:16], dtype=np.float32)
             if not np.isfinite(np.concatenate((bbox_2d, dimensions, location))).all():

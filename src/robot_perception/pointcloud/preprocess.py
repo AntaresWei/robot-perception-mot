@@ -95,6 +95,7 @@ def voxel_downsample(points: np.ndarray, *, voxel_size: float) -> np.ndarray:
     if not np.isfinite(cloud).all():
         raise ValueError("voxel downsampling requires finite point values")
 
+    # floor 后的整数坐标是体素 key；同一 key 的点用 add.at 累加并取均值。
     voxel_indices = np.floor(cloud[:, :3] / voxel_size).astype(np.int64)
     _, inverse, counts = np.unique(voxel_indices, axis=0, return_inverse=True, return_counts=True)
     accumulators = np.zeros((len(counts), cloud.shape[1]), dtype=np.result_type(cloud.dtype, np.float32))
@@ -116,6 +117,7 @@ def statistical_outlier_filter(points: np.ndarray, *, nb_neighbors: int, std_rat
         raise ValueError("outlier filtering requires finite point values")
 
     neighbor_count = min(nb_neighbors + 1, len(cloud))
+    # KD-tree 将邻域查询从 O(N^2) 降为可接受的近邻查询复杂度。
     distances, _ = cKDTree(cloud[:, :3]).query(cloud[:, :3], k=neighbor_count)
     mean_distances = distances[:, 1:].mean(axis=1)
     threshold = mean_distances.mean() + std_ratio * mean_distances.std()
@@ -135,6 +137,7 @@ def radius_outlier_filter(points: np.ndarray, *, radius: float, min_neighbors: i
     if not np.isfinite(cloud).all():
         raise ValueError("outlier filtering requires finite point values")
 
+    # query_ball_point 返回包含自身的邻居数，因此要减去 1 才是“其他点”数量。
     counts = cKDTree(cloud[:, :3]).query_ball_point(cloud[:, :3], radius, return_length=True)
     return cloud[(counts - 1) >= min_neighbors].copy()
 
@@ -168,6 +171,7 @@ def preprocess_point_cloud(
 
     if ground_config.get("method") != "ransac":
         raise ValueError(f"unsupported ground segmentation method: {ground_config.get('method')!r}")
+    # 每一阶段保留独立数组，便于诊断某个参数导致的点数骤减。
     raw_points = _validate_point_cloud(points).copy()
     valid_points = remove_invalid_points(raw_points)
     roi_points = crop_roi(valid_points, **pointcloud_config["roi"])

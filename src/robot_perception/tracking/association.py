@@ -52,9 +52,11 @@ def hungarian_association(
     if num_tracks and num_detections and valid.any():
         valid_costs = costs[valid]
         max_cost = float(np.max(valid_costs))
+        # Hungarian 必须看到有限代价；无效 pair 使用明显更大的哨兵值。
         invalid_cost = max(max_cost + abs(max_cost) + 1.0, 1.0)
         assignment_costs = np.where(valid, costs, invalid_cost)
         assigned_tracks, assigned_detections = linear_sum_assignment(assignment_costs)
+        # 仅保留原有效掩码中的分配，防止“被迫”选择哨兵代价 pair。
         assigned_valid = valid[assigned_tracks, assigned_detections]
         matches = np.column_stack((assigned_tracks[assigned_valid], assigned_detections[assigned_valid])).astype(
             np.int64, copy=False
@@ -138,6 +140,7 @@ def associate_detections_to_tracks(
         noise = np.asarray(measurement_noise, dtype=np.float64)
     if noise.shape != (measurement_dimension, measurement_dimension):
         raise ValueError(f"measurement_noise must have shape ({measurement_dimension}, {measurement_dimension})")
+    # 批量计算 H P H^T；einsum 避免为每条 track 编写 Python 矩阵乘法循环。
     innovation_covariances = np.einsum("ij,njk,lk->nil", matrix, covariances, matrix) + noise
     predicted_measurements = states @ matrix.T
     return mahalanobis_association(
@@ -168,6 +171,7 @@ def euclidean_nearest_neighbor(
 ) -> AssociationResult:
     """One-to-one Euclidean nearest-neighbor baseline using Hungarian costs."""
 
+    # 该方法仅作为后续 benchmark 的简单基线，主关联仍使用 Mahalanobis 距离。
     costs = euclidean_cost_matrix(track_positions, detections)
     if max_distance is None:
         valid_mask = np.isfinite(costs)

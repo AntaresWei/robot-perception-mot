@@ -64,7 +64,7 @@ conda run -n robot-perception-mot python scripts/run_kalman_demo.py
 
 ---
 
-## 4. 我学到了什么（面试可复述）
+## 4. 我学到了什么
 
 1. **技术点**：Kalman 增益满足 `K = P H^T S^-1`；实现时通过解线性方程
    代替显式求逆，并注意右端矩阵方向以满足 NumPy shape。

@@ -21,6 +21,7 @@ def _as_vector(value: Any, size: int, name: str) -> np.ndarray:
 
 
 def _as_covariance(value: Any, size: int, name: str) -> np.ndarray:
+    # 允许标量、对角向量或完整矩阵，统一转换为方阵后再做 PSD 校验。
     array = np.asarray(value, dtype=np.float64)
     if array.ndim == 0:
         if not np.isfinite(array).all() or float(array) < 0.0:
@@ -45,6 +46,7 @@ def _as_covariance(value: Any, size: int, name: str) -> np.ndarray:
 
 
 def _stabilize_covariance(covariance: np.ndarray, floor: float) -> np.ndarray:
+    # 浮点误差可能破坏对称性或产生极小负特征值；谱分解后设置下限可恢复稳定性。
     symmetric = (covariance + covariance.T) * 0.5
     eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
     if not np.isfinite(eigenvalues).all():
@@ -112,6 +114,7 @@ class ConstantVelocityKalmanFilter:
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError("dt must be finite and positive")
         transition = np.eye(STATE_DIM, dtype=np.float64)
+        # 常速度模型只有位置对速度的 dt 耦合，速度本身保持不变。
         transition[:3, 3:] = np.eye(3) * float(dt)
         predicted_state = transition @ self._state
         predicted_covariance = transition @ self._covariance @ transition.T + self._process_noise
@@ -135,6 +138,7 @@ class ConstantVelocityKalmanFilter:
             raise FloatingPointError("update produced NaN or Inf innovation covariance")
         try:
             cross_covariance = self._covariance @ self._measurement_matrix.T
+            # 解 S X = (P H^T)^T，避免显式求逆；最后转置得到 K=P H^T S^-1。
             gain = np.linalg.solve(innovation_covariance, cross_covariance.T).T
         except np.linalg.LinAlgError as error:
             raise np.linalg.LinAlgError("innovation covariance is singular") from error
@@ -142,6 +146,7 @@ class ConstantVelocityKalmanFilter:
         identity = np.eye(STATE_DIM)
         residual_projection = identity - gain @ self._measurement_matrix
         updated_state = self._state + gain @ innovation
+        # Joseph 形式比 (I-KH)P 更能抵抗舍入误差，适合长期迭代。
         updated_covariance = (
             residual_projection @ self._covariance @ residual_projection.T
             + gain @ self._measurement_noise @ gain.T

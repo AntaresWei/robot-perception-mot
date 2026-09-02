@@ -48,6 +48,7 @@ def mahalanobis_distance(
     """
 
     if innovation_covariance is None:
+        # 支持直接传 innovation，也支持传 measurement/prediction 由函数内部相减。
         innovation = _vector(measurement_or_innovation, "innovation")
         covariance = _covariance(predicted_measurement_or_covariance, innovation.size, "innovation_covariance")
     else:
@@ -112,6 +113,7 @@ def mahalanobis_gating(
     valid_detections = np.isfinite(observed).all(axis=1)
     residuals = observed[None, :, :] - predicted[:, None, :]
     for track_index in np.flatnonzero(valid_rows):
+        # 每条 track 的 S 可能不同，故按 track 解线性方程；检测维度仍一次处理。
         detection_indices = np.flatnonzero(valid_detections)
         if detection_indices.size == 0:
             continue
@@ -125,6 +127,7 @@ def mahalanobis_gating(
             "ij,ij->i", residuals[track_index, detection_indices], solved
         )
     distances = np.maximum(distances, 0.0)
+    # 非有限输入保持为 inf，自然不会通过阈值，也不会被后续分配。
     valid_mask = np.isfinite(distances) & (distances <= threshold)
     return GatingResult(distances=distances, valid_mask=valid_mask)
 

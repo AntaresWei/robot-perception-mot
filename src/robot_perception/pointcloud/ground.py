@@ -17,6 +17,7 @@ class GroundSegmentationResult:
 
 
 def _fit_plane(points_xyz: np.ndarray) -> np.ndarray | None:
+    # 对中心化点做 SVD，最小奇异向量就是拟合平面的法向量。
     centered = points_xyz - points_xyz.mean(axis=0)
     _, singular_values, right_vectors = np.linalg.svd(centered, full_matrices=False)
     if singular_values.size < 3 or singular_values[-2] <= np.finfo(float).eps:
@@ -65,6 +66,7 @@ def segment_ground_ransac(
     best_error = np.inf
 
     for _ in range(num_iterations):
+        # 随机采样只负责提出候选平面，最终模型会用全部内点重新拟合。
         sample = xyz[generator.choice(len(xyz), size=ransac_n, replace=False)]
         plane = _fit_plane(sample)
         if plane is None:
@@ -81,6 +83,7 @@ def segment_ground_ransac(
     if best_mask is None or best_count < ransac_n:
         return GroundSegmentationResult(cloud[:0].copy(), cloud.copy(), None)
 
+    # 用 RANSAC 找到的内点重新估计，通常比单次三点模型更稳定。
     refined_plane = _fit_plane(xyz[best_mask])
     if refined_plane is None:
         return GroundSegmentationResult(cloud[:0].copy(), cloud.copy(), None)
