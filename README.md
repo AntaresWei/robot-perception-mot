@@ -84,6 +84,13 @@ frame = dataset[0]
 `frame.image` is OpenCV BGR, `frame.lidar_points` is `float32` with shape
 `(N, 4)`, and annotations retain KITTI Tracking IDs and camera-frame boxes.
 
+## Detection Adapters
+
+`GTDetector` and `NoisyGTDetector` convert KITTI `label_02` annotations into
+the common `Detection3D` contract. The noisy adapter is a controlled input for
+tracker validation. **GT-based tracking experiments validate only the tracking
+implementation and must not be reported as detector performance.**
+
 ## Status
 
 No performance metrics are available. Experiments and reported metrics must be

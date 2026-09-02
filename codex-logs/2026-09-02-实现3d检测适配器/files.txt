@@ -1,0 +1,21 @@
+# 变更清单
+
+基线 `8a8f86a295a491133eb67fddb4b25a864093460e` → 当前工作区 ｜ 7 个文件，+439 / -1
+
+```
+7	0	README.md
+11	0	configs/detector.yaml
+115	0	scripts/run_detection.py
+13	1	src/robot_perception/detection/__init__.py
+148	0	src/robot_perception/detection/adapter.py
+42	0	src/robot_perception/detection/base.py
+103	0	tests/test_detector_adapter.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- configs/detector.yaml
+- scripts/run_detection.py
+- src/robot_perception/detection/adapter.py
+- src/robot_perception/detection/base.py
+- tests/test_detector_adapter.py

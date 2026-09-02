@@ -1,0 +1,486 @@
+diff --git a/README.md b/README.md
+index 1b10e5f..a69507a 100644
+--- a/README.md
++++ b/README.md
+@@ -84,6 +84,13 @@ frame = dataset[0]
+ `frame.image` is OpenCV BGR, `frame.lidar_points` is `float32` with shape
+ `(N, 4)`, and annotations retain KITTI Tracking IDs and camera-frame boxes.
+ 
++## Detection Adapters
++
++`GTDetector` and `NoisyGTDetector` convert KITTI `label_02` annotations into
++the common `Detection3D` contract. The noisy adapter is a controlled input for
++tracker validation. **GT-based tracking experiments validate only the tracking
++implementation and must not be reported as detector performance.**
++
+ ## Status
+ 
+ No performance metrics are available. Experiments and reported metrics must be
+diff --git a/configs/detector.yaml b/configs/detector.yaml
+new file mode 100644
+index 0000000..b476469
+--- /dev/null
++++ b/configs/detector.yaml
+@@ -0,0 +1,11 @@
++detector:
++  type: gt
++  score_threshold: 0.0
++  class_ids: [1, 2, 3]
++  default_score: 1.0
++  noise:
++    position_std: [0.20, 0.20, 0.20]
++    dimensions_std: [0.10, 0.10, 0.10]
++    yaw_std: 0.05
++    score_std: 0.02
++    random_seed: 7
+diff --git a/scripts/run_detection.py b/scripts/run_detection.py
+new file mode 100644
+index 0000000..8e31415
+--- /dev/null
++++ b/scripts/run_detection.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++"""Run a detector adapter on one KITTI frame and print detection statistics."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from collections import Counter
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
++
++from robot_perception.dataset import KittiTrackingDataset
++from robot_perception.detection import GTDetector, NoisyGTDetector, class_name_for_id
++
++
++def _load_yaml(path: Path) -> dict[str, Any]:
++    try:
++        import yaml
++    except ImportError as error:
++        raise RuntimeError("PyYAML is required to read configuration files") from error
++    if not path.is_file():
++        raise FileNotFoundError(f"configuration file not found: {path}")
++    content = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++    if not isinstance(content, dict):
++        raise ValueError(f"configuration must be a mapping: {path}")
++    return content
++
++
++def _resolve_path(path_value: str | Path) -> Path:
++    # 配置使用相对仓库路径，避免把本机数据目录写死到脚本中。
++    path = Path(path_value)
++    return path if path.is_absolute() else REPOSITORY_ROOT / path
++
++
++def _build_detector(config: dict[str, Any], detector_type: str | None) -> GTDetector:
++    settings = config.get("detector")
++    if not isinstance(settings, dict):
++        raise ValueError("detector config must contain a detector mapping")
++    selected_type = detector_type or settings.get("type", "gt")
++    common_kwargs = {
++        "score_threshold": float(settings.get("score_threshold", 0.0)),
++        "class_ids": settings.get("class_ids"),
++        "default_score": float(settings.get("default_score", 1.0)),
++    }
++    if selected_type == "gt":
++        return GTDetector(**common_kwargs)
++    if selected_type == "noisy_gt":
++        noise = settings.get("noise")
++        if not isinstance(noise, dict):
++            raise ValueError("noisy_gt requires detector.noise mapping")
++        return NoisyGTDetector(
++            **common_kwargs,
++            position_std=noise.get("position_std", 0.0),
++            dimensions_std=noise.get("dimensions_std", 0.0),
++            yaw_std=float(noise.get("yaw_std", 0.0)),
++            score_std=float(noise.get("score_std", 0.0)),
++            random_seed=noise.get("random_seed"),
++        )
++    raise ValueError(f"unsupported detector type: {selected_type!r}")
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dataset-config", type=Path, default=REPOSITORY_ROOT / "configs" / "dataset.yaml")
++    parser.add_argument("--detector-config", type=Path, default=REPOSITORY_ROOT / "configs" / "detector.yaml")
++    parser.add_argument("--root", type=Path, help="KITTI root; overrides dataset.root")
++    parser.add_argument("--split", choices=("training", "testing"), help="KITTI split; overrides dataset config")
++    parser.add_argument("--detector", choices=("gt", "noisy_gt"), help="Detector adapter; overrides config")
++    parser.add_argument("--sequence", required=True, help="KITTI sequence ID, for example 0000")
++    parser.add_argument("--frame", required=True, type=int, help="KITTI frame ID, for example 100")
++    args = parser.parse_args()
++
++    try:
++        dataset_settings = _load_yaml(args.dataset_config).get("dataset")
++        if not isinstance(dataset_settings, dict):
++            raise ValueError("dataset config must contain a dataset mapping")
++        root_value = args.root or dataset_settings.get("root")
++        if root_value is None:
++            raise ValueError("provide --root or set dataset.root in the dataset config")
++        dataset = KittiTrackingDataset(
++            _resolve_path(root_value),
++            split=args.split or str(dataset_settings.get("split", "training")),
++            sequences=[args.sequence],
++            load_images=False,
++            load_annotations=True,
++        )
++        frame = dataset.get_frame(args.sequence, args.frame)
++        detector = _build_detector(_load_yaml(args.detector_config), args.detector)
++        detections = detector.predict(frame)
++    except (FileNotFoundError, RuntimeError, ValueError, KeyError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++
++    class_distribution = Counter(class_name_for_id(detection.class_id) for detection in detections)
++    # 空 detection 时输出 None，避免对空数组求 min/max 产生误导性数值。
++    scores = np.asarray([detection.score for detection in detections], dtype=np.float64)
++    score_statistics = (
++        {"min": float(scores.min()), "max": float(scores.max()), "mean": float(scores.mean())}
++        if scores.size
++        else {"min": None, "max": None, "mean": None}
++    )
++    print(f"Frame: {frame.sequence_id}/{frame.frame_id:06d}")
++    print(f"Num detections: {len(detections)}")
++    print(f"Class distribution: {dict(sorted(class_distribution.items()))}")
++    print(f"Score statistics: {score_statistics}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/robot_perception/detection/__init__.py b/src/robot_perception/detection/__init__.py
+index f2b4bb6..ace81f7 100644
+--- a/src/robot_perception/detection/__init__.py
++++ b/src/robot_perception/detection/__init__.py
+@@ -1 +1,13 @@
+-"""Detection package namespace; detector implementations are intentionally absent."""
++"""Detector interfaces and detector-output adapters."""
++
++from robot_perception.detection.adapter import GTDetector, NoisyGTDetector
++from robot_perception.detection.base import BaseDetector, KITTI_CLASS_IDS, KITTI_CLASS_NAMES, class_name_for_id
++
++__all__ = [
++    "BaseDetector",
++    "GTDetector",
++    "KITTI_CLASS_IDS",
++    "KITTI_CLASS_NAMES",
++    "NoisyGTDetector",
++    "class_name_for_id",
++]
+diff --git a/src/robot_perception/detection/adapter.py b/src/robot_perception/detection/adapter.py
+new file mode 100644
+index 0000000..b94b12d
+--- /dev/null
++++ b/src/robot_perception/detection/adapter.py
+@@ -0,0 +1,148 @@
++"""Detector adapters that normalize KITTI labels into ``Detection3D``."""
++
++from __future__ import annotations
++
++from collections.abc import Iterable
++
++import numpy as np
++
++from robot_perception.common.types import Detection3D, FrameData, KittiTrackingAnnotation
++from robot_perception.detection.base import BaseDetector, KITTI_CLASS_IDS
++
++
++def _as_non_negative_std(value: float | Iterable[float], size: int, name: str) -> np.ndarray:
++    # 配置允许简写为标量，也允许按 x/y/z 维度分别设置噪声标准差。
++    array = np.asarray(value, dtype=np.float64)
++    if array.ndim == 0:
++        array = np.full(size, float(array), dtype=np.float64)
++    if array.shape != (size,) or not np.isfinite(array).all() or (array < 0.0).any():
++        raise ValueError(f"{name} must be a finite non-negative scalar or a ({size},) vector")
++    return array
++
++
++class GTDetector(BaseDetector):
++    """Adapt KITTI ground-truth annotations into normalized 3D detections.
++
++    This adapter validates tracking and association behavior only. It must not
++    be used to claim detector accuracy, recall, mAP, or real detector metrics.
++    """
++
++    def __init__(
++        self,
++        *,
++        score_threshold: float = 0.0,
++        class_ids: Iterable[int] | None = None,
++        default_score: float = 1.0,
++    ) -> None:
++        if not np.isfinite(score_threshold) or not 0.0 <= score_threshold <= 1.0:
++            raise ValueError("score_threshold must be finite and within [0, 1]")
++        if not np.isfinite(default_score) or not 0.0 <= default_score <= 1.0:
++            raise ValueError("default_score must be finite and within [0, 1]")
++        allowed_ids = None if class_ids is None else frozenset(int(class_id) for class_id in class_ids)
++        if allowed_ids is not None and not allowed_ids.issubset(set(KITTI_CLASS_IDS.values())):
++            raise ValueError("class_ids contains an unsupported KITTI class ID")
++        self.score_threshold = float(score_threshold)
++        self.class_ids = allowed_ids
++        self.default_score = float(default_score)
++
++    def _annotation_to_detection(
++        self,
++        annotation: KittiTrackingAnnotation,
++        *,
++        apply_score_threshold: bool = True,
++    ) -> Detection3D | None:
++        class_id = KITTI_CLASS_IDS.get(annotation.class_name)
++        # DontCare 与未知类别不能进入 Tracker，否则会生成无意义轨迹。
++        if class_id is None or (self.class_ids is not None and class_id not in self.class_ids):
++            return None
++        # KITTI GT 通常没有 detector score，统一赋 default_score 以满足 Detection3D 契约。
++        score = self.default_score if annotation.score is None else float(annotation.score)
++        if not np.isfinite(score) or (apply_score_threshold and score < self.score_threshold):
++            return None
++        if not np.isfinite(annotation.location).all() or not np.isfinite(annotation.dimensions).all():
++            return None
++        if not np.isfinite(annotation.yaw):
++            return None
++        return Detection3D(
++            position=annotation.location.astype(np.float64, copy=True),
++            dimensions=annotation.dimensions.astype(np.float64, copy=True),
++            yaw=float(annotation.yaw),
++            score=score,
++            class_id=class_id,
++        )
++
++    def predict(self, frame: FrameData) -> list[Detection3D]:
++        """Convert the frame's optional KITTI labels without mutating them."""
++
++        if frame.annotations is None:
++            return []
++        detections: list[Detection3D] = []
++        for annotation in frame.annotations:
++            detection = self._annotation_to_detection(annotation)
++            if detection is not None:
++                detections.append(detection)
++        return detections
++
++
++class NoisyGTDetector(GTDetector):
++    """Generate controlled noisy observations from GT for tracker validation."""
++
++    def __init__(
++        self,
++        *,
++        position_std: float | Iterable[float] = 0.0,
++        dimensions_std: float | Iterable[float] = 0.0,
++        yaw_std: float = 0.0,
++        score_std: float = 0.0,
++        random_seed: int | None = None,
++        score_threshold: float = 0.0,
++        class_ids: Iterable[int] | None = None,
++        default_score: float = 1.0,
++    ) -> None:
++        super().__init__(
++            score_threshold=score_threshold,
++            class_ids=class_ids,
++            default_score=default_score,
++        )
++        self.position_std = _as_non_negative_std(position_std, 3, "position_std")
++        self.dimensions_std = _as_non_negative_std(dimensions_std, 3, "dimensions_std")
++        if not np.isfinite(yaw_std) or yaw_std < 0.0:
++            raise ValueError("yaw_std must be finite and non-negative")
++        if not np.isfinite(score_std) or score_std < 0.0:
++            raise ValueError("score_std must be finite and non-negative")
++        self.yaw_std = float(yaw_std)
++        self.score_std = float(score_std)
++        self._random_generator = np.random.default_rng(random_seed)
++
++    def predict(self, frame: FrameData) -> list[Detection3D]:
++        """Perturb GT observations while keeping dimensions and scores valid."""
++
++        noisy_detections: list[Detection3D] = []
++        if frame.annotations is None:
++            return []
++        for annotation in frame.annotations:
++            # 先保留低分 GT，才能让 threshold 对加噪后的 score 生效。
++            detection = self._annotation_to_detection(annotation, apply_score_threshold=False)
++            if detection is None:
++                continue
++            # 单个 Generator 由固定 seed 驱动，使同一实验配置可以复现实验输入。
++            position = detection.position + self._random_generator.normal(0.0, self.position_std)
++            # 长宽高必须为正；截断避免噪声使 3D box 退化。
++            dimensions = np.maximum(
++                detection.dimensions + self._random_generator.normal(0.0, self.dimensions_std),
++                np.finfo(np.float64).eps,
++            )
++            yaw = float(detection.yaw + self._random_generator.normal(0.0, self.yaw_std))
++            # 分数限制在 [0, 1]，再应用 threshold，模拟 detector 输出后的筛选顺序。
++            score = float(np.clip(detection.score + self._random_generator.normal(0.0, self.score_std), 0.0, 1.0))
++            if score >= self.score_threshold:
++                noisy_detections.append(
++                    Detection3D(
++                        position=position,
++                        dimensions=dimensions,
++                        yaw=yaw,
++                        score=score,
++                        class_id=detection.class_id,
++                    )
++                )
++        return noisy_detections
+diff --git a/src/robot_perception/detection/base.py b/src/robot_perception/detection/base.py
+new file mode 100644
+index 0000000..768c1ac
+--- /dev/null
++++ b/src/robot_perception/detection/base.py
+@@ -0,0 +1,42 @@
++"""Detector interface and common KITTI class definitions."""
++
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++
++from robot_perception.common.types import Detection3D, FrameData
++
++
++# 将语义相近的 KITTI 标签归到稳定 ID，Tracker 只依赖数值类别而不读取原始文本。
++KITTI_CLASS_IDS: dict[str, int] = {
++    "Car": 1,
++    "Van": 1,
++    "Truck": 1,
++    "Pedestrian": 2,
++    "Person_sitting": 2,
++    "Cyclist": 3,
++    "Tram": 4,
++    "Misc": 5,
++}
++
++KITTI_CLASS_NAMES: dict[int, str] = {
++    1: "Car",
++    2: "Pedestrian",
++    3: "Cyclist",
++    4: "Tram",
++    5: "Misc",
++}
++
++
++class BaseDetector(ABC):
++    """Detector boundary consumed by later tracking code."""
++
++    @abstractmethod
++    def predict(self, frame: FrameData) -> list[Detection3D]:
++        """Return normalized 3D detections for a single synchronized frame."""
++
++
++def class_name_for_id(class_id: int) -> str:
++    """Return a human-readable class label for CLI summaries."""
++
++    return KITTI_CLASS_NAMES.get(class_id, f"unknown:{class_id}")
+diff --git a/tests/test_detector_adapter.py b/tests/test_detector_adapter.py
+new file mode 100644
+index 0000000..d4a3c46
+--- /dev/null
++++ b/tests/test_detector_adapter.py
+@@ -0,0 +1,103 @@
++"""Tests for GT and noisy-GT detector adapters."""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from robot_perception.common.types import FrameData, KittiTrackingAnnotation
++from robot_perception.detection import BaseDetector, GTDetector, NoisyGTDetector
++
++
++def _annotation(
++    *,
++    class_name: str = "Car",
++    score: float | None = None,
++    location: tuple[float, float, float] = (1.0, 2.0, 3.0),
++) -> KittiTrackingAnnotation:
++    return KittiTrackingAnnotation(
++        frame_id=0,
++        track_id=4,
++        class_name=class_name,
++        truncation=0.0,
++        occlusion=0,
++        alpha=0.0,
++        bbox_2d=np.asarray((1.0, 2.0, 3.0, 4.0)),
++        dimensions=np.asarray((4.0, 2.0, 1.5)),
++        location=np.asarray(location),
++        yaw=0.25,
++        score=score,
++    )
++
++
++def _frame(annotations: list[KittiTrackingAnnotation] | None) -> FrameData:
++    return FrameData(
++        sequence_id="0000",
++        frame_id=0,
++        image=None,
++        lidar_points=np.empty((0, 4)),
++        calibration=None,
++        annotations=annotations,
++    )
++
++
++def test_gt_detector_implements_base_interface_and_normalizes_detection() -> None:
++    detector = GTDetector()
++
++    assert isinstance(detector, BaseDetector)
++    detection = detector.predict(_frame([_annotation()]))[0]
++
++    np.testing.assert_allclose(detection.position, (1.0, 2.0, 3.0))
++    np.testing.assert_allclose(detection.dimensions, (4.0, 2.0, 1.5))
++    assert detection.yaw == pytest.approx(0.25)
++    assert detection.score == pytest.approx(1.0)
++    assert detection.class_id == 1
++
++
++def test_gt_detector_filters_unknown_classes_and_selected_classes() -> None:
++    frame = _frame(
++        [
++            _annotation(class_name="DontCare"),
++            _annotation(class_name="Pedestrian"),
++            _annotation(class_name="Car"),
++        ]
++    )
++
++    detections = GTDetector(class_ids=[1]).predict(frame)
++
++    assert [detection.class_id for detection in detections] == [1]
++
++
++def test_gt_detector_applies_score_threshold() -> None:
++    frame = _frame([_annotation(score=0.4), _annotation(score=0.8)])
++
++    detections = GTDetector(score_threshold=0.5).predict(frame)
++
++    assert len(detections) == 1
++    assert detections[0].score == pytest.approx(0.8)
++
++
++def test_gt_detector_returns_empty_when_annotations_are_unavailable() -> None:
++    assert GTDetector().predict(_frame(None)) == []
++
++
++def test_noisy_gt_detector_is_reproducible_and_changes_detection() -> None:
++    frame = _frame([_annotation()])
++    first = NoisyGTDetector(position_std=0.5, dimensions_std=0.2, yaw_std=0.1, score_std=0.1, random_seed=3)
++    second = NoisyGTDetector(position_std=0.5, dimensions_std=0.2, yaw_std=0.1, score_std=0.1, random_seed=3)
++
++    first_detection = first.predict(frame)[0]
++    second_detection = second.predict(frame)[0]
++
++    np.testing.assert_allclose(first_detection.position, second_detection.position)
++    np.testing.assert_allclose(first_detection.dimensions, second_detection.dimensions)
++    assert first_detection.yaw == pytest.approx(second_detection.yaw)
++    assert first_detection.score == pytest.approx(second_detection.score)
++    assert not np.allclose(first_detection.position, (1.0, 2.0, 3.0))
++    assert (first_detection.dimensions > 0.0).all()
++
++
++def test_noisy_gt_detector_applies_threshold_after_score_noise() -> None:
++    detector = NoisyGTDetector(score_std=0.0, default_score=0.4, score_threshold=0.5, random_seed=0)
++
++    assert detector.predict(_frame([_annotation()])) == []

@@ -1,0 +1,11 @@
+detector:
+  type: gt
+  score_threshold: 0.0
+  class_ids: [1, 2, 3]
+  default_score: 1.0
+  noise:
+    position_std: [0.20, 0.20, 0.20]
+    dimensions_std: [0.10, 0.10, 0.10]
+    yaw_std: 0.05
+    score_std: 0.02
+    random_seed: 7
