@@ -1,0 +1,18 @@
+# 变更清单
+
+基线 `1101f4927f00ff341c946239ae74cd6cf57bdcff` → 当前工作区 ｜ 5 个文件，+497 / -1
+
+```
+28	1	src/robot_perception/tracking/__init__.py
+182	0	src/robot_perception/tracking/association.py
+132	0	src/robot_perception/tracking/gating.py
+99	0	tests/test_association.py
+56	0	tests/test_gating.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- src/robot_perception/tracking/association.py
+- src/robot_perception/tracking/gating.py
+- tests/test_association.py
+- tests/test_gating.py
