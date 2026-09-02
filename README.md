@@ -5,10 +5,11 @@ dataset.
 
 ## Current Stage
 
-This repository currently contains only the project scaffold: Python package
-namespaces, shared dataclasses, YAML configuration, and pytest test structure.
-Detection, tracking algorithms, calibration, point cloud processing, ROS2
-nodes, evaluation, and visualization are intentionally not implemented yet.
+The repository now contains the KITTI loader, calibration/projection utilities,
+point-cloud preprocessing, Kalman/association primitives, and detector
+adapters. `GTDetector` and `NoisyGTDetector` are available for tracker
+validation. A real PointPillars adapter is provided for MMDetection3D when its
+compatible runtime and checkpoint are supplied.
 
 ## Planned Layout
 
@@ -87,9 +88,23 @@ frame = dataset[0]
 ## Detection Adapters
 
 `GTDetector` and `NoisyGTDetector` convert KITTI `label_02` annotations into
-the common `Detection3D` contract. The noisy adapter is a controlled input for
-tracker validation. **GT-based tracking experiments validate only the tracking
-implementation and must not be reported as detector performance.**
+the common `Detection3D` contract. `MMDet3DPointPillarsAdapter` converts
+MMDetection3D `boxes_3d`, `scores_3d`, and `labels_3d` into the same contract.
+The GT adapters are controlled inputs for tracker validation. **GT-based
+tracking experiments validate only the tracking implementation and must not be
+reported as detector performance.**
+
+The current `robot-perception-mot` environment does not include MMDetection3D,
+MMEngine, MMCV, or a PointPillars checkpoint, so real-model inference remains
+pending those external prerequisites.
+
+When the official MMDetection3D PointPillars config and checkpoint are
+available, set `detector.real.config` and `detector.real.checkpoint` in
+`configs/detector.yaml`, then run:
+
+```bash
+python scripts/run_detection.py --detector real --sequence 0000 --frame 100
+```
 
 ## Status
 

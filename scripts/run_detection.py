@@ -15,7 +15,13 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from robot_perception.dataset import KittiTrackingDataset
-from robot_perception.detection import GTDetector, NoisyGTDetector, class_name_for_id
+from robot_perception.detection import (
+    BaseDetector,
+    GTDetector,
+    MMDet3DPointPillarsAdapter,
+    NoisyGTDetector,
+    class_name_for_id,
+)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -37,7 +43,7 @@ def _resolve_path(path_value: str | Path) -> Path:
     return path if path.is_absolute() else REPOSITORY_ROOT / path
 
 
-def _build_detector(config: dict[str, Any], detector_type: str | None) -> GTDetector:
+def _build_detector(config: dict[str, Any], detector_type: str | None) -> BaseDetector:
     settings = config.get("detector")
     if not isinstance(settings, dict):
         raise ValueError("detector config must contain a detector mapping")
@@ -61,6 +67,21 @@ def _build_detector(config: dict[str, Any], detector_type: str | None) -> GTDete
             score_std=float(noise.get("score_std", 0.0)),
             random_seed=noise.get("random_seed"),
         )
+    if selected_type in {"real", "mmdet3d_pointpillars"}:
+        real = settings.get("real")
+        if not isinstance(real, dict):
+            raise ValueError("real detector requires detector.real mapping")
+        config_path = real.get("config")
+        checkpoint_path = real.get("checkpoint")
+        if config_path is None or checkpoint_path is None:
+            raise ValueError("detector.real.config and detector.real.checkpoint must be set")
+        return MMDet3DPointPillarsAdapter(
+            _resolve_path(config_path),
+            _resolve_path(checkpoint_path),
+            device=str(real.get("device", "cuda:0")),
+            score_threshold=float(real.get("score_threshold", settings.get("score_threshold", 0.0))),
+            class_mapping={int(key): int(value) for key, value in dict(real.get("class_mapping", {})).items()},
+        )
     raise ValueError(f"unsupported detector type: {selected_type!r}")
 
 
@@ -70,7 +91,7 @@ def main() -> int:
     parser.add_argument("--detector-config", type=Path, default=REPOSITORY_ROOT / "configs" / "detector.yaml")
     parser.add_argument("--root", type=Path, help="KITTI root; overrides dataset.root")
     parser.add_argument("--split", choices=("training", "testing"), help="KITTI split; overrides dataset config")
-    parser.add_argument("--detector", choices=("gt", "noisy_gt"), help="Detector adapter; overrides config")
+    parser.add_argument("--detector", choices=("gt", "noisy_gt", "real"), help="Detector adapter; overrides config")
     parser.add_argument("--sequence", required=True, help="KITTI sequence ID, for example 0000")
     parser.add_argument("--frame", required=True, type=int, help="KITTI frame ID, for example 100")
     args = parser.parse_args()

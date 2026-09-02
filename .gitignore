@@ -31,6 +31,11 @@ data/*
 !data/README.md
 
 # =====================
+# Weights
+# =====================
+*.pth
+
+# =====================
 # Outputs
 # =====================
 outputs/logs/*
@@ -63,3 +68,4 @@ dist/
 # =====================
 JMODT-main/
 codex-log-kit/
+mmdetection3d-1.0/

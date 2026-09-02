@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any, Callable
 
 import numpy as np
 
@@ -146,3 +149,151 @@ class NoisyGTDetector(GTDetector):
                     )
                 )
         return noisy_detections
+
+
+class MMDet3DPointPillarsAdapter(BaseDetector):
+    """Adapt MMDetection3D PointPillars KITTI outputs to ``Detection3D``.
+
+    The official MMDetection3D inference API consumes a point-cloud file path,
+    so the adapter writes the current frame to a temporary `.bin` file. Tests
+    can inject ``model`` and ``inference_fn`` to exercise output conversion
+    without installing MMDetection3D or downloading a checkpoint.
+    """
+
+    # 官方 KITTI 三分类配置顺序为 Pedestrian、Cyclist、Car。
+    DEFAULT_LABEL_MAPPING = {0: 2, 1: 3, 2: 1}
+
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        checkpoint_path: str | Path | None = None,
+        *,
+        device: str = "cuda:0",
+        score_threshold: float = 0.0,
+        class_mapping: dict[int, int] | None = None,
+        model: Any | None = None,
+        inference_fn: Callable[[Any, Any], Any] | None = None,
+    ) -> None:
+        if not np.isfinite(score_threshold) or not 0.0 <= score_threshold <= 1.0:
+            raise ValueError("score_threshold must be finite and within [0, 1]")
+        self.score_threshold = float(score_threshold)
+        self.device = device
+        self.class_mapping = dict(self.DEFAULT_LABEL_MAPPING if class_mapping is None else class_mapping)
+        if any(int(key) < 0 or int(value) <= 0 for key, value in self.class_mapping.items()):
+            raise ValueError("class_mapping must map non-negative model labels to positive project IDs")
+        self._inference_fn = inference_fn
+        self.model = model
+        self._uses_path_input = False
+        if self.model is None:
+            if config_path is None or checkpoint_path is None:
+                raise ValueError("config_path and checkpoint_path are required for the real MMDetection3D adapter")
+            self.model, self._inference_fn = self._load_model(
+                Path(config_path), Path(checkpoint_path), device
+            )
+            self._uses_path_input = True
+        elif self._inference_fn is None:
+            raise ValueError("inference_fn is required when injecting a model for testing")
+
+    @staticmethod
+    def _load_model(
+        config_path: Path,
+        checkpoint_path: Path,
+        device: str,
+    ) -> tuple[Any, Callable[[Any, str], Any]]:
+        if not config_path.is_file():
+            raise FileNotFoundError(f"MMDetection3D config not found: {config_path}")
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"PointPillars checkpoint not found: {checkpoint_path}")
+        try:
+            from mmdet3d.apis import inference_detector, init_model
+        except ImportError as error:
+            raise RuntimeError(
+                "MMDetection3D stack is unavailable or incompatible "
+                f"({error}); install the compatible official stack before using the real adapter"
+            ) from error
+        return init_model(str(config_path), str(checkpoint_path), device=device), inference_detector
+
+    @staticmethod
+    def _to_numpy(value: Any, name: str) -> np.ndarray:
+        # 兼容 torch.Tensor、NumPy 数组和 MMDetection3D 包装对象。
+        tensor = getattr(value, "tensor", value)
+        if hasattr(tensor, "detach"):
+            tensor = tensor.detach().cpu().numpy()
+        array = np.asarray(tensor)
+        if not np.isfinite(array).all():
+            raise ValueError(f"MMDetection3D output {name} contains NaN or Inf values")
+        return array
+
+    @classmethod
+    def _extract_output(cls, output: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        sample = output
+        if isinstance(sample, (list, tuple)):
+            if len(sample) == 1:
+                sample = sample[0]
+            elif len(sample) == 2 and isinstance(sample[0], (list, tuple, dict)):
+                # MMDetection3D v1.0 的 inference_detector 返回 (result, data)。
+                sample = sample[0]
+                if isinstance(sample, (list, tuple)):
+                    if len(sample) != 1:
+                        raise ValueError("MMDetection3D result list must contain exactly one frame")
+                    sample = sample[0]
+            else:
+                raise ValueError("MMDetection3D output must contain one frame result")
+        if isinstance(sample, dict):
+            sample = sample.get("pred_instances_3d", sample)
+            boxes = sample.get("bboxes_3d", sample.get("boxes_3d"))
+            scores = sample.get("scores_3d")
+            labels = sample.get("labels_3d")
+        else:
+            sample = getattr(sample, "pred_instances_3d", sample)
+            boxes = getattr(sample, "bboxes_3d", getattr(sample, "boxes_3d", None))
+            scores = getattr(sample, "scores_3d", None)
+            labels = getattr(sample, "labels_3d", None)
+        if boxes is None or scores is None or labels is None:
+            raise ValueError("MMDetection3D output must contain boxes_3d, scores_3d, and labels_3d")
+        box_array = cls._to_numpy(boxes, "boxes_3d")
+        score_array = cls._to_numpy(scores, "scores_3d").reshape(-1)
+        label_array = cls._to_numpy(labels, "labels_3d").reshape(-1).astype(np.int64)
+        if box_array.ndim != 2 or box_array.shape[1] < 7:
+            raise ValueError(f"boxes_3d must have shape (N, >=7), got {box_array.shape}")
+        if len(box_array) != len(score_array) or len(box_array) != len(label_array):
+            raise ValueError("boxes_3d, scores_3d, and labels_3d must have matching lengths")
+        return box_array[:, :7], score_array, label_array
+
+    def _run_inference(self, points: np.ndarray) -> Any:
+        if self._inference_fn is not None and not self._uses_path_input:
+            return self._inference_fn(self.model, points)
+        # 官方 API 以路径为输入；临时文件生命周期覆盖整个推理调用。
+        with NamedTemporaryFile(suffix=".bin") as point_file:
+            np.asarray(points, dtype=np.float32).tofile(point_file)
+            point_file.flush()
+            return self._inference_fn(self.model, point_file.name)
+
+    def predict(self, frame: FrameData) -> list[Detection3D]:
+        """Run PointPillars and return project-level ``Detection3D`` objects."""
+
+        points = np.asarray(frame.lidar_points)
+        if points.ndim != 2 or points.shape[1] != 4:
+            raise ValueError(f"frame.lidar_points must have shape (N, 4), got {points.shape}")
+        if not np.isfinite(points).all():
+            raise ValueError("frame.lidar_points contains NaN or Inf values")
+        boxes, scores, labels = self._extract_output(self._run_inference(points))
+        detections: list[Detection3D] = []
+        for box, score, label in zip(boxes, scores, labels):
+            class_id = self.class_mapping.get(int(label))
+            if class_id is None or float(score) < self.score_threshold:
+                continue
+            # MMDetection3D LiDAR box 默认顺序为 x,y,z,w,l,h,yaw；项目统一为 l,w,h。
+            dimensions = box[[4, 3, 5]].astype(np.float64, copy=True)
+            if not np.isfinite(dimensions).all() or (dimensions <= 0.0).any():
+                continue
+            detections.append(
+                Detection3D(
+                    position=box[:3].astype(np.float64, copy=True),
+                    dimensions=dimensions,
+                    yaw=float(box[6]),
+                    score=float(score),
+                    class_id=class_id,
+                )
+            )
+        return detections

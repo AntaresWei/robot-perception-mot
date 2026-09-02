@@ -9,3 +9,13 @@ detector:
     yaw_std: 0.05
     score_std: 0.02
     random_seed: 7
+  real:
+    type: mmdet3d_pointpillars
+    config: mmdetection3d-1.0/configs/pointpillars/hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class.py
+    checkpoint: hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth
+    device: cuda:0
+    score_threshold: 0.3
+    class_mapping:
+      0: 2
+      1: 3
+      2: 1
