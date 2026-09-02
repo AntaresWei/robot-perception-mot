@@ -1,0 +1,18 @@
+# 变更清单
+
+基线 `8c38442f7ee8d8b35297879587dd63b5e653ccaa` → 当前工作区 ｜ 5 个文件，+396 / -1
+
+```
+15	0	configs/kalman.yaml
+106	0	scripts/run_kalman_demo.py
+5	1	src/robot_perception/tracking/__init__.py
+156	0	src/robot_perception/tracking/kalman.py
+114	0	tests/test_kalman.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- configs/kalman.yaml
+- scripts/run_kalman_demo.py
+- src/robot_perception/tracking/kalman.py
+- tests/test_kalman.py

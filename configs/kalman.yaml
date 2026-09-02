@@ -1,0 +1,15 @@
+kalman:
+  process_noise:
+    diagonal: [0.01, 0.01, 0.01, 0.10, 0.10, 0.10]
+  measurement_noise:
+    diagonal: [0.25, 0.25, 0.25]
+  initial_covariance:
+    diagonal: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  covariance_floor: 1.0e-12
+  trajectory:
+    num_steps: 100
+    initial_position: [0.0, 0.0, 0.0]
+    velocity: [0.8, -0.25, 0.1]
+    measurement_std: [0.5, 0.5, 0.5]
+    dt: 1.0
+    seed: 7

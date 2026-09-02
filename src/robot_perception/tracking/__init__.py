@@ -1,1 +1,5 @@
-"""Tracking package namespace; tracking algorithms are not implemented yet."""
+"""Tracking primitives."""
+
+from robot_perception.tracking.kalman import ConstantVelocityKalmanFilter, KalmanFilter
+
+__all__ = ["ConstantVelocityKalmanFilter", "KalmanFilter"]

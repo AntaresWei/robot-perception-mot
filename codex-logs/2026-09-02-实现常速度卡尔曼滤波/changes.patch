@@ -1,0 +1,426 @@
+diff --git a/configs/kalman.yaml b/configs/kalman.yaml
+new file mode 100644
+index 0000000..549bd3a
+--- /dev/null
++++ b/configs/kalman.yaml
+@@ -0,0 +1,15 @@
++kalman:
++  process_noise:
++    diagonal: [0.01, 0.01, 0.01, 0.10, 0.10, 0.10]
++  measurement_noise:
++    diagonal: [0.25, 0.25, 0.25]
++  initial_covariance:
++    diagonal: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
++  covariance_floor: 1.0e-12
++  trajectory:
++    num_steps: 100
++    initial_position: [0.0, 0.0, 0.0]
++    velocity: [0.8, -0.25, 0.1]
++    measurement_std: [0.5, 0.5, 0.5]
++    dt: 1.0
++    seed: 7
+diff --git a/scripts/run_kalman_demo.py b/scripts/run_kalman_demo.py
+new file mode 100644
+index 0000000..5844e5a
+--- /dev/null
++++ b/scripts/run_kalman_demo.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""Compare noisy position measurements with a Kalman-filtered trajectory."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import numpy as np
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
++
++from robot_perception.tracking import ConstantVelocityKalmanFilter
++
++
++def _load_config(path: Path) -> dict[str, object]:
++    try:
++        import yaml
++    except ImportError as error:
++        raise RuntimeError("PyYAML is required to read the Kalman demo configuration") from error
++    if not path.is_file():
++        raise FileNotFoundError(f"configuration file not found: {path}")
++    config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++    if not isinstance(config, dict) or not isinstance(config.get("kalman"), dict):
++        raise ValueError(f"configuration must contain a kalman mapping: {path}")
++    return config["kalman"]
++
++
++def _diagonal(config: object, size: int, name: str) -> np.ndarray:
++    if not isinstance(config, dict) or "diagonal" not in config:
++        raise ValueError(f"{name} must contain a diagonal list")
++    values = np.asarray(config["diagonal"], dtype=np.float64)
++    if values.shape != (size,):
++        raise ValueError(f"{name}.diagonal must have {size} values")
++    return values
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", type=Path, default=REPOSITORY_ROOT / "configs" / "kalman.yaml")
++    parser.add_argument("--output", type=Path, default=REPOSITORY_ROOT / "outputs" / "metrics" / "kalman_baseline.json")
++    args = parser.parse_args()
++
++    try:
++        config = _load_config(args.config)
++        trajectory = config.get("trajectory")
++        if not isinstance(trajectory, dict):
++            raise ValueError("kalman.trajectory mapping is required")
++        num_steps = int(trajectory["num_steps"])
++        dt = float(trajectory["dt"])
++        if num_steps < 2 or dt <= 0.0:
++            raise ValueError("trajectory.num_steps must be at least 2 and dt must be positive")
++        initial_position = np.asarray(trajectory["initial_position"], dtype=np.float64)
++        velocity = np.asarray(trajectory["velocity"], dtype=np.float64)
++        measurement_std = np.asarray(trajectory["measurement_std"], dtype=np.float64)
++        if initial_position.shape != (3,) or velocity.shape != (3,) or measurement_std.shape != (3,):
++            raise ValueError("trajectory vectors must all have shape (3,)")
++        if (measurement_std <= 0.0).any() or not np.isfinite(measurement_std).all():
++            raise ValueError("measurement_std must be finite and positive")
++
++        steps = np.arange(num_steps, dtype=np.float64)
++        truth = initial_position + steps[:, None] * dt * velocity
++        rng = np.random.default_rng(int(trajectory["seed"]))
++        measurements = truth + rng.normal(0.0, measurement_std, size=truth.shape)
++        measurement_noise = np.square(measurement_std)
++        kalman = ConstantVelocityKalmanFilter(
++            measurements[0],
++            initial_velocity=np.zeros(3),
++            initial_covariance=_diagonal(config.get("initial_covariance"), 6, "initial_covariance"),
++            process_noise=_diagonal(config.get("process_noise"), 6, "process_noise"),
++            measurement_noise=measurement_noise,
++            covariance_floor=float(config.get("covariance_floor", 1e-12)),
++        )
++        filtered_positions = [kalman.state[:3]]
++        for measurement in measurements[1:]:
++            kalman.predict(dt=dt)
++            filtered_positions.append(kalman.update(measurement)[:3])
++        filtered = np.asarray(filtered_positions)
++        raw_rmse = float(np.sqrt(np.mean((measurements - truth) ** 2)))
++        filtered_rmse = float(np.sqrt(np.mean((filtered - truth) ** 2)))
++        result = {
++            "dataset": "synthetic_constant_velocity",
++            "num_steps": num_steps,
++            "dt": dt,
++            "seed": int(trajectory["seed"]),
++            "raw_measurement_rmse": raw_rmse,
++            "kalman_filtered_rmse": filtered_rmse,
++            "improvement": raw_rmse - filtered_rmse,
++            "config": str(args.config),
++        }
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
++    except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++
++    print(json.dumps(result, indent=2))
++    print(f"Saved metrics: {args.output}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/robot_perception/tracking/__init__.py b/src/robot_perception/tracking/__init__.py
+index 4c05cfb..5b3561e 100644
+--- a/src/robot_perception/tracking/__init__.py
++++ b/src/robot_perception/tracking/__init__.py
+@@ -1 +1,5 @@
+-"""Tracking package namespace; tracking algorithms are not implemented yet."""
++"""Tracking primitives."""
++
++from robot_perception.tracking.kalman import ConstantVelocityKalmanFilter, KalmanFilter
++
++__all__ = ["ConstantVelocityKalmanFilter", "KalmanFilter"]
+diff --git a/src/robot_perception/tracking/kalman.py b/src/robot_perception/tracking/kalman.py
+new file mode 100644
+index 0000000..9ae0a63
+--- /dev/null
++++ b/src/robot_perception/tracking/kalman.py
+@@ -0,0 +1,156 @@
++"""Self-contained 3D constant-velocity Kalman filter."""
++
++from __future__ import annotations
++
++from typing import Any
++
++import numpy as np
++
++
++STATE_DIM = 6
++MEASUREMENT_DIM = 3
++
++
++def _as_vector(value: Any, size: int, name: str) -> np.ndarray:
++    vector = np.asarray(value, dtype=np.float64)
++    if vector.shape != (size,):
++        raise ValueError(f"{name} must have shape ({size},), got {vector.shape}")
++    if not np.isfinite(vector).all():
++        raise ValueError(f"{name} contains NaN or Inf values")
++    return vector
++
++
++def _as_covariance(value: Any, size: int, name: str) -> np.ndarray:
++    array = np.asarray(value, dtype=np.float64)
++    if array.ndim == 0:
++        if not np.isfinite(array).all() or float(array) < 0.0:
++            raise ValueError(f"{name} scalar must be finite and non-negative")
++        matrix = np.eye(size, dtype=np.float64) * float(array)
++    elif array.shape == (size,):
++        if not np.isfinite(array).all() or (array < 0.0).any():
++            raise ValueError(f"{name} diagonal must be finite and non-negative")
++        matrix = np.diag(array)
++    elif array.shape == (size, size):
++        matrix = array.copy()
++    else:
++        raise ValueError(f"{name} must be scalar, ({size},), or ({size}, {size}), got {array.shape}")
++    if not np.isfinite(matrix).all():
++        raise ValueError(f"{name} contains NaN or Inf values")
++    if not np.allclose(matrix, matrix.T, atol=1e-12):
++        raise ValueError(f"{name} must be symmetric")
++    eigenvalues = np.linalg.eigvalsh(matrix)
++    if eigenvalues.min(initial=0.0) < -1e-10:
++        raise ValueError(f"{name} must be positive semidefinite")
++    return (matrix + matrix.T) * 0.5
++
++
++def _stabilize_covariance(covariance: np.ndarray, floor: float) -> np.ndarray:
++    symmetric = (covariance + covariance.T) * 0.5
++    eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
++    if not np.isfinite(eigenvalues).all():
++        raise FloatingPointError("covariance eigenvalues contain NaN or Inf values")
++    stabilized = (eigenvectors * np.maximum(eigenvalues, floor)) @ eigenvectors.T
++    return (stabilized + stabilized.T) * 0.5
++
++
++class ConstantVelocityKalmanFilter:
++    """Estimate 3D position and velocity with a constant-velocity model.
++
++    State order is ``[px, py, pz, vx, vy, vz]`` and measurements are
++    ``[px, py, pz]``. Methods mutate the filter state and return a copy.
++    """
++
++    def __init__(
++        self,
++        initial_position: np.ndarray,
++        *,
++        initial_velocity: np.ndarray | None = None,
++        initial_covariance: np.ndarray | float = 1.0,
++        process_noise: np.ndarray | float = 1e-2,
++        measurement_noise: np.ndarray | float = 1e-1,
++        covariance_floor: float = 1e-12,
++    ) -> None:
++        if covariance_floor <= 0.0 or not np.isfinite(covariance_floor):
++            raise ValueError("covariance_floor must be finite and positive")
++        position = _as_vector(initial_position, 3, "initial_position")
++        velocity = np.zeros(3, dtype=np.float64) if initial_velocity is None else _as_vector(initial_velocity, 3, "initial_velocity")
++        self._state = np.concatenate((position, velocity))
++        self._covariance = _as_covariance(initial_covariance, STATE_DIM, "initial_covariance")
++        self._process_noise = _as_covariance(process_noise, STATE_DIM, "process_noise")
++        self._measurement_noise = _as_covariance(measurement_noise, MEASUREMENT_DIM, "measurement_noise")
++        self._covariance_floor = float(covariance_floor)
++        self._measurement_matrix = np.hstack((np.eye(3), np.zeros((3, 3))))
++        self._transition_matrix = np.eye(STATE_DIM)
++
++    @property
++    def state(self) -> np.ndarray:
++        return self._state.copy()
++
++    @property
++    def covariance(self) -> np.ndarray:
++        return self._covariance.copy()
++
++    @property
++    def measurement_matrix(self) -> np.ndarray:
++        return self._measurement_matrix.copy()
++
++    @property
++    def transition_matrix(self) -> np.ndarray:
++        return self._transition_matrix.copy()
++
++    @property
++    def process_noise(self) -> np.ndarray:
++        return self._process_noise.copy()
++
++    @property
++    def measurement_noise(self) -> np.ndarray:
++        return self._measurement_noise.copy()
++
++    def predict(self, dt: float = 1.0) -> np.ndarray:
++        """Advance the state by ``dt`` seconds and return the predicted state."""
++
++        if not np.isfinite(dt) or dt <= 0.0:
++            raise ValueError("dt must be finite and positive")
++        transition = np.eye(STATE_DIM, dtype=np.float64)
++        transition[:3, 3:] = np.eye(3) * float(dt)
++        predicted_state = transition @ self._state
++        predicted_covariance = transition @ self._covariance @ transition.T + self._process_noise
++        if not np.isfinite(predicted_state).all() or not np.isfinite(predicted_covariance).all():
++            raise FloatingPointError("prediction produced NaN or Inf values")
++        self._transition_matrix = transition
++        self._state = predicted_state
++        self._covariance = _stabilize_covariance(predicted_covariance, self._covariance_floor)
++        return self.state
++
++    def update(self, measurement: np.ndarray) -> np.ndarray:
++        """Correct the state with one 3D position measurement."""
++
++        observation = _as_vector(measurement, MEASUREMENT_DIM, "measurement")
++        innovation = observation - self._measurement_matrix @ self._state
++        innovation_covariance = (
++            self._measurement_matrix @ self._covariance @ self._measurement_matrix.T
++            + self._measurement_noise
++        )
++        if not np.isfinite(innovation_covariance).all():
++            raise FloatingPointError("update produced NaN or Inf innovation covariance")
++        try:
++            cross_covariance = self._covariance @ self._measurement_matrix.T
++            gain = np.linalg.solve(innovation_covariance, cross_covariance.T).T
++        except np.linalg.LinAlgError as error:
++            raise np.linalg.LinAlgError("innovation covariance is singular") from error
++
++        identity = np.eye(STATE_DIM)
++        residual_projection = identity - gain @ self._measurement_matrix
++        updated_state = self._state + gain @ innovation
++        updated_covariance = (
++            residual_projection @ self._covariance @ residual_projection.T
++            + gain @ self._measurement_noise @ gain.T
++        )
++        if not np.isfinite(updated_state).all() or not np.isfinite(updated_covariance).all():
++            raise FloatingPointError("update produced NaN or Inf values")
++        self._state = updated_state
++        self._covariance = _stabilize_covariance(updated_covariance, self._covariance_floor)
++        return self.state
++
++
++KalmanFilter = ConstantVelocityKalmanFilter
+diff --git a/tests/test_kalman.py b/tests/test_kalman.py
+new file mode 100644
+index 0000000..27118d5
+--- /dev/null
++++ b/tests/test_kalman.py
+@@ -0,0 +1,114 @@
++"""Tests for the constant-velocity Kalman filter."""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from robot_perception.tracking import ConstantVelocityKalmanFilter
++
++
++def _filter(**kwargs: object) -> ConstantVelocityKalmanFilter:
++    return ConstantVelocityKalmanFilter(
++        np.zeros(3),
++        initial_covariance=np.eye(6),
++        process_noise=np.eye(6) * 1e-3,
++        measurement_noise=np.eye(3) * 1e-2,
++        **kwargs,
++    )
++
++
++def test_initialization() -> None:
++    kalman = _filter(initial_velocity=np.asarray((1.0, 2.0, 3.0)))
++
++    np.testing.assert_allclose(kalman.state, (0.0, 0.0, 0.0, 1.0, 2.0, 3.0))
++    assert kalman.covariance.shape == (6, 6)
++    assert kalman.measurement_matrix.shape == (3, 6)
++    assert kalman.transition_matrix.shape == (6, 6)
++
++
++def test_prediction_updates_position_using_velocity() -> None:
++    kalman = _filter(initial_velocity=np.asarray((1.0, -2.0, 0.5)))
++
++    predicted = kalman.predict()
++
++    np.testing.assert_allclose(predicted[:3], (1.0, -2.0, 0.5))
++    np.testing.assert_allclose(predicted[3:], (1.0, -2.0, 0.5))
++
++
++def test_update_moves_state_toward_measurement() -> None:
++    kalman = _filter()
++    kalman.predict()
++
++    updated = kalman.update(np.asarray((10.0, 0.0, 0.0)))
++
++    assert 0.0 < updated[0] < 10.0
++    assert updated[3] > 0.0
++    np.testing.assert_allclose(updated[[1, 2, 4, 5]], 0.0, atol=1e-12)
++
++
++def test_variable_dt_changes_transition_and_prediction() -> None:
++    kalman = _filter(initial_velocity=np.asarray((2.0, 0.0, 0.0)))
++
++    predicted = kalman.predict(dt=0.25)
++
++    np.testing.assert_allclose(predicted[0], 0.5)
++    np.testing.assert_allclose(kalman.transition_matrix[0, 3], 0.25)
++
++
++def test_covariance_remains_symmetric_positive_definite() -> None:
++    kalman = _filter()
++    for measurement in (np.asarray((1.0, 0.0, 0.0)), np.asarray((2.0, 0.0, 0.0)), np.asarray((3.0, 0.0, 0.0))):
++        kalman.predict(dt=0.5)
++        kalman.update(measurement)
++
++    covariance = kalman.covariance
++    np.testing.assert_allclose(covariance, covariance.T, atol=1e-12)
++    assert np.linalg.eigvalsh(covariance).min() > 0.0
++    assert np.isfinite(covariance).all()
++
++
++def test_filter_reduces_noisy_measurement_rmse() -> None:
++    rng = np.random.default_rng(3)
++    steps = np.arange(60, dtype=np.float64)
++    truth = np.column_stack((0.7 * steps, -0.2 * steps, 0.1 * steps))
++    measurements = truth + rng.normal(0.0, 0.8, size=truth.shape)
++    kalman = ConstantVelocityKalmanFilter(
++        measurements[0],
++        initial_covariance=np.eye(6) * 10.0,
++        process_noise=np.eye(6) * 1e-3,
++        measurement_noise=np.eye(3) * 0.64,
++    )
++    filtered = [kalman.state[:3]]
++    for measurement in measurements[1:]:
++        kalman.predict()
++        filtered.append(kalman.update(measurement)[:3])
++
++    raw_rmse = float(np.sqrt(np.mean((measurements - truth) ** 2)))
++    filtered_rmse = float(np.sqrt(np.mean((np.asarray(filtered) - truth) ** 2)))
++    assert filtered_rmse < raw_rmse
++
++
++@pytest.mark.parametrize(
++    "constructor_kwargs",
++    [
++        {"initial_position": np.zeros(2)},
++        {"initial_position": np.full(3, np.nan)},
++        {"initial_position": np.zeros(3), "initial_covariance": np.eye(5)},
++        {"initial_position": np.zeros(3), "measurement_noise": np.diag((-1.0, 1.0, 1.0))},
++    ],
++)
++def test_invalid_initialization_is_rejected(constructor_kwargs: dict[str, object]) -> None:
++    with pytest.raises(ValueError):
++        ConstantVelocityKalmanFilter(**constructor_kwargs)
++
++
++def test_invalid_predict_and_update_inputs_are_rejected() -> None:
++    kalman = _filter()
++
++    with pytest.raises(ValueError, match="dt"):
++        kalman.predict(dt=0.0)
++    with pytest.raises(ValueError, match="measurement"):
++        kalman.update(np.zeros(2))
++    with pytest.raises(ValueError, match="measurement"):
++        kalman.update(np.full(3, np.inf))
