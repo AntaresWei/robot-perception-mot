@@ -13,3 +13,6 @@ visualization:
   point_radius: 1
   # 使用 rectified camera depth 的百分位映射 TURBO 色表，避免极远点压缩颜色对比。
   depth_percentiles: [2.0, 98.0]
+  # 离线视频默认展示最终用于 perception/fusion demo 的非地面点。
+  video_lidar_points_mode: non_ground
+  video_fps: 10.0

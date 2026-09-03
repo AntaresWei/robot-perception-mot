@@ -70,4 +70,4 @@ dist/
 # =====================
 JMODT-main/
 codex-log-kit/
-mmdetection3d-1.0/
+mmdetection3d-1.0/**

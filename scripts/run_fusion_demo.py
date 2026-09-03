@@ -204,6 +204,99 @@ def _output_paths(output: Path | None, sequence_id: str, frame_id: int, mode: st
     }
 
 
+def _associate_frame_detections(
+    frame: object,
+    calibration: object,
+    fusion_settings: dict[str, object],
+) -> object:
+    """Run the existing experimental object-level fusion path for one frame."""
+
+    # GTDetector 这里只作为实验用 LiDAR 侧输入；KITTI 相机标注位置是 bottom-center。
+    gt_detections = GTDetector(class_ids={1, 2, 3}).predict(frame)
+    lidar_detections: list[Detection3D] = []
+    for detection in gt_detections:
+        centered_position = detection.position.copy()
+        centered_position[1] -= detection.dimensions[2] / 2.0
+        lidar_detections.append(
+            Detection3D(centered_position, detection.dimensions, detection.yaw, detection.score, detection.class_id)
+        )
+    camera_detections = SyntheticCameraDetector(
+        score_threshold=float(fusion_settings.get("camera_score_threshold", 0.0)),
+        class_ids={1, 2, 3},
+        bbox_noise_std=float(fusion_settings.get("camera_bbox_noise_std", 0.0)),
+        random_seed=fusion_settings.get("random_seed"),
+    ).predict(frame)
+    return associate_camera_lidar_detections(
+        lidar_detections,
+        camera_detections,
+        calibration,
+        image_shape=frame.image.shape,
+        iou_threshold=float(fusion_settings["iou_threshold"]),
+        center_distance_threshold=float(fusion_settings["center_distance_threshold"]),
+        coordinate_frame="camera",
+    )
+
+
+def render_fusion_modes(
+    frame: object,
+    calibration: object,
+    *,
+    fusion_settings: dict[str, object],
+    pointcloud_settings: dict[str, object],
+    ground_settings: dict[str, object],
+    visualization_settings: dict[str, object],
+    modes: tuple[str, ...],
+) -> tuple[dict[str, np.ndarray], dict[str, int], object]:
+    """Render requested point-cloud modes while reusing one fusion calculation.
+
+    ``raw`` uses ``frame.lidar_points`` directly. ``non_ground`` is the final
+    output of the configured preprocessing pipeline. ``none`` renders only
+    object-level fusion overlays. Calibration and fusion geometry are called
+    unchanged; this function merely selects the visualization input.
+    """
+
+    if frame.image is None:
+        raise ValueError("fusion visualization requires a camera image")
+    requested_modes = tuple(dict.fromkeys(modes))
+    invalid_modes = sorted(set(requested_modes) - LIDAR_POINTS_MODES)
+    if invalid_modes:
+        raise ValueError(f"lidar_points_mode must be one of {sorted(LIDAR_POINTS_MODES)}, got {invalid_modes}")
+    fusion_result = _associate_frame_detections(frame, calibration, fusion_settings)
+    raw_points = frame.lidar_points
+    if "non_ground" in requested_modes:
+        preprocess_result = preprocess_point_cloud(
+            raw_points,
+            pointcloud_config=pointcloud_settings,
+            ground_config=ground_settings,
+        )
+        non_ground_points = preprocess_result.non_ground_points
+    else:
+        non_ground_points = np.empty((0, raw_points.shape[1]), dtype=raw_points.dtype)
+    points_by_mode = {
+        mode: _select_lidar_points(mode, raw_points, non_ground_points)
+        for mode in requested_modes
+    }
+    projections = {
+        mode: _project_points_with_depth(points, calibration, frame.image.shape)
+        for mode, points in points_by_mode.items()
+    }
+    rendered: dict[str, np.ndarray] = {}
+    counts: dict[str, int] = {}
+    for mode, (pixels, depths) in projections.items():
+        rendered[mode] = _render_fusion_image(
+            frame.image,
+            pixels,
+            depths,
+            fusion_result,
+            mode=mode,
+            visualization_settings=visualization_settings,
+        )
+        counts[mode] = len(pixels)
+    counts["raw_input"] = len(raw_points)
+    counts["non_ground_input"] = len(non_ground_points)
+    return rendered, counts, fusion_result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-config", type=Path, default=REPOSITORY_ROOT / "configs" / "dataset.yaml")
@@ -243,62 +336,21 @@ def main() -> int:
             raise ValueError("fusion visualization requires a camera image")
         calibration = parse_kitti_calibration(_calibration_path(root, split, frame.sequence_id))
 
-        # GTDetector 这里只作为实验用 LiDAR 侧输入；KITTI 相机标注位置是 bottom-center。
-        gt_detections = GTDetector(class_ids={1, 2, 3}).predict(frame)
-        lidar_detections: list[Detection3D] = []
-        for detection in gt_detections:
-            centered_position = detection.position.copy()
-            centered_position[1] -= detection.dimensions[2] / 2.0
-            lidar_detections.append(
-                Detection3D(centered_position, detection.dimensions, detection.yaw, detection.score, detection.class_id)
-            )
-        camera_detections = SyntheticCameraDetector(
-            score_threshold=float(fusion_settings.get("camera_score_threshold", 0.0)),
-            class_ids={1, 2, 3},
-            bbox_noise_std=float(fusion_settings.get("camera_bbox_noise_std", 0.0)),
-            random_seed=fusion_settings.get("random_seed"),
-        ).predict(frame)
-        fusion_result = associate_camera_lidar_detections(
-            lidar_detections,
-            camera_detections,
-            calibration,
-            image_shape=frame.image.shape,
-            iou_threshold=float(fusion_settings["iou_threshold"]),
-            center_distance_threshold=float(fusion_settings["center_distance_threshold"]),
-            coordinate_frame="camera",
-        )
         mode = str(visualization_settings.get("lidar_points_mode", "raw"))
         if mode not in LIDAR_POINTS_MODES:
             raise ValueError(f"lidar_points_mode must be one of {sorted(LIDAR_POINTS_MODES)}, got {mode!r}")
-        # raw 保留 calibration debug 输入；non_ground 严格来自完整预处理流水线的最终输出。
-        preprocess_result = preprocess_point_cloud(
-            frame.lidar_points,
-            pointcloud_config=pointcloud_settings,
-            ground_config=ground_settings,
+        rendered, counts, fusion_result = render_fusion_modes(
+            frame,
+            calibration,
+            fusion_settings=fusion_settings,
+            pointcloud_settings=pointcloud_settings,
+            ground_settings=ground_settings,
+            visualization_settings=visualization_settings,
+            modes=("raw", "non_ground", mode),
         )
-        points_by_mode = {
-            "raw": _select_lidar_points("raw", frame.lidar_points, preprocess_result.non_ground_points),
-            "non_ground": _select_lidar_points("non_ground", frame.lidar_points, preprocess_result.non_ground_points),
-            "none": _select_lidar_points("none", frame.lidar_points, preprocess_result.non_ground_points),
-        }
-        projections = {
-            name: _project_points_with_depth(points, calibration, frame.image.shape)
-            for name, points in points_by_mode.items()
-        }
         paths = _output_paths(args.output, frame.sequence_id, frame.frame_id, mode)
         import cv2
 
-        rendered: dict[str, np.ndarray] = {}
-        for render_mode in dict.fromkeys(("raw", "non_ground", mode)):
-            pixels, depths = projections[render_mode]
-            rendered[render_mode] = _render_fusion_image(
-                frame.image,
-                pixels,
-                depths,
-                fusion_result,
-                mode=render_mode,
-                visualization_settings=visualization_settings,
-            )
         for name, output in paths.items():
             source_mode = mode if name == "primary" else name
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -311,8 +363,8 @@ def main() -> int:
     print(f"Saved fusion visualization ({mode}): {paths['primary']}")
     print(f"Saved raw projection: {paths['raw']}")
     print(f"Saved non-ground projection: {paths['non_ground']}")
-    print(f"Projected raw LiDAR points: {len(projections['raw'][0])}")
-    print(f"Projected non-ground LiDAR points: {len(projections['non_ground'][0])}")
+    print(f"Projected raw LiDAR points: {counts['raw']}")
+    print(f"Projected non-ground LiDAR points: {counts['non_ground']}")
     print(f"Fused objects: {len(fusion_result.fused_detections)}")
     print(f"Unmatched LiDAR: {fusion_result.unmatched_lidar.tolist()}")
     print(f"Unmatched camera: {fusion_result.unmatched_camera.tolist()}")

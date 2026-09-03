@@ -174,3 +174,7 @@ def test_visualization_projection_depths_align_with_pixels() -> None:
 
     np.testing.assert_allclose(pixels, ((50.0, 50.0),))
     np.testing.assert_allclose(depths, (10.0,))
+
+
+def test_render_modes_deduplicates_requested_mode_names() -> None:
+    assert tuple(dict.fromkeys(("raw", "non_ground", "raw"))) == ("raw", "non_ground")

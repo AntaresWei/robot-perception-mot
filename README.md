@@ -341,6 +341,16 @@ perception/fusion demo；`none` 只显示 object-level fusion box。每次都输
 供人工对比，并按配置输出主图。投影点以 rectified camera depth 的 TURBO 色表着色，
 不再使用固定绿色；绿色框仍是 3D box 图像投影，蓝色框是 Camera 2D detection。
 
+将 sequence 离线写为 MP4（默认 `non_ground`，共用每帧最终 fusion visual） ：
+
+```bash
+python scripts/render_fusion_video.py --sequence 0000
+```
+
+默认输出为 `outputs/videos/fusion_0000_non_ground.mp4`。可用
+`--lidar-points-mode raw` 生成 calibration debug 视频，或通过 `--fps`、
+`--start-frame` 和 `--end-frame` 调整离线渲染范围。
+
 ## Status
 
 PointPillars `0000/100` 单帧推理已在 GPU 6 验证。MOT 指标仍需在后续 Tracker
