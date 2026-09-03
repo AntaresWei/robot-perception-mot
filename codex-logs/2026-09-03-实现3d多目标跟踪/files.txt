@@ -1,0 +1,21 @@
+# 变更清单
+
+基线 `2e985a4ba63c0b66bb2aa47d3fcc8ef3aba44e75` → 当前工作区 ｜ 7 个文件，+664 / -0
+
+```
+12	0	configs/tracker.yaml
+187	0	scripts/run_tracker_demo.py
+4	0	src/robot_perception/tracking/__init__.py
+123	0	src/robot_perception/tracking/track.py
+146	0	src/robot_perception/tracking/tracker.py
+83	0	tests/test_track.py
+109	0	tests/test_tracker.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- scripts/run_tracker_demo.py
+- src/robot_perception/tracking/track.py
+- src/robot_perception/tracking/tracker.py
+- tests/test_track.py
+- tests/test_tracker.py

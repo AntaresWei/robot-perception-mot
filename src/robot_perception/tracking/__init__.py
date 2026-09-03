@@ -1,6 +1,8 @@
 """Tracking primitives."""
 
 from robot_perception.tracking.kalman import ConstantVelocityKalmanFilter, KalmanFilter
+from robot_perception.tracking.track import Track
+from robot_perception.tracking.tracker import MultiObjectTracker
 from robot_perception.tracking.association import (
     AssociationResult,
     associate_detections_to_tracks,
@@ -21,6 +23,8 @@ __all__ = [
     "ConstantVelocityKalmanFilter",
     "GatingResult",
     "KalmanFilter",
+    "MultiObjectTracker",
+    "Track",
     "associate_detections_to_tracks",
     "euclidean_nearest_neighbor",
     "gate_measurements",

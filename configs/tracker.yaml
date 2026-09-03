@@ -1,6 +1,18 @@
 tracker:
   min_hits: 3
   max_age: 5
+  gating_threshold: 9.21
+  initial_covariance: 1.0
+  process_noise: 0.01
+  measurement_noise: 0.1
+
+demo:
+  num_frames: 80
+  num_objects: 3
+  measurement_std: 0.35
+  miss_probability: 0.15
+  association_distance: 2.5
+  random_seed: 7
 
 gating:
   enabled: true

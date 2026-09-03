@@ -1,0 +1,723 @@
+diff --git a/configs/tracker.yaml b/configs/tracker.yaml
+index 58d152b..f338f1a 100644
+--- a/configs/tracker.yaml
++++ b/configs/tracker.yaml
+@@ -1,6 +1,18 @@
+ tracker:
+   min_hits: 3
+   max_age: 5
++  gating_threshold: 9.21
++  initial_covariance: 1.0
++  process_noise: 0.01
++  measurement_noise: 0.1
++
++demo:
++  num_frames: 80
++  num_objects: 3
++  measurement_std: 0.35
++  miss_probability: 0.15
++  association_distance: 2.5
++  random_seed: 7
+ 
+ gating:
+   enabled: true
+diff --git a/scripts/run_tracker_demo.py b/scripts/run_tracker_demo.py
+new file mode 100644
+index 0000000..2e9c2fe
+--- /dev/null
++++ b/scripts/run_tracker_demo.py
+@@ -0,0 +1,187 @@
++#!/usr/bin/env python3
++"""Run a synthetic multi-object tracking demo and write baseline metrics."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++from scipy.optimize import linear_sum_assignment
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
++
++from robot_perception.common.types import Detection3D
++from robot_perception.tracking import MultiObjectTracker
++
++
++def _load_yaml(path: Path) -> dict[str, object]:
++    try:
++        import yaml
++    except ImportError as error:
++        raise RuntimeError("PyYAML is required to read tracker demo configuration") from error
++    if not path.is_file():
++        raise FileNotFoundError(f"configuration file not found: {path}")
++    content = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++    if not isinstance(content, dict):
++        raise ValueError(f"configuration must be a mapping: {path}")
++    return content
++
++
++def _match_positions(
++    truth: np.ndarray,
++    states: list[object],
++    distance_threshold: float,
++) -> tuple[list[tuple[int, int]], list[int], list[int]]:
++    if not len(truth) or not len(states):
++        return [], list(range(len(truth))), list(range(len(states)))
++    estimated = np.stack([state.state[:3] for state in states])
++    # 仅用于 demo 指标的独立匹配，不复用 Tracker 内部关联结果，避免指标自证。
++    distances = np.linalg.norm(truth[:, None, :] - estimated[None, :, :], axis=2)
++    truth_indices, state_indices = linear_sum_assignment(distances)
++    valid = distances[truth_indices, state_indices] <= distance_threshold
++    matches = list(zip(truth_indices[valid].tolist(), state_indices[valid].tolist()))
++    matched_truth = {index for index, _ in matches}
++    matched_states = {index for _, index in matches}
++    return matches, sorted(set(range(len(truth))) - matched_truth), sorted(set(range(len(states))) - matched_states)
++
++
++def _plot_trajectories(
++    truth_history: np.ndarray,
++    estimate_history: dict[int, list[tuple[float, float]]],
++    output_path: Path,
++) -> None:
++    os.environ.setdefault("MPLCONFIGDIR", "/tmp/robot-perception-mot-mpl")
++    import matplotlib
++
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++
++    figure, axis = plt.subplots(figsize=(9, 6))
++    for object_index in range(truth_history.shape[1]):
++        axis.plot(
++            truth_history[:, object_index, 0],
++            truth_history[:, object_index, 1],
++            linestyle="--",
++            linewidth=1.5,
++            label=f"GT {object_index + 1}",
++        )
++    for track_id, positions in sorted(estimate_history.items()):
++        values = np.asarray(positions)
++        axis.plot(values[:, 0], values[:, 1], linewidth=1.2, label=f"Track {track_id}")
++    axis.set_title("Synthetic 3D MOT trajectory (XY projection)")
++    axis.set_xlabel("x (m)")
++    axis.set_ylabel("y (m)")
++    axis.grid(True, alpha=0.3)
++    axis.legend(ncol=2, fontsize=8)
++    figure.tight_layout()
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    figure.savefig(output_path, dpi=140)
++    plt.close(figure)
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", type=Path, default=REPOSITORY_ROOT / "configs" / "tracker.yaml")
++    parser.add_argument("--metrics-output", type=Path, default=REPOSITORY_ROOT / "outputs" / "metrics" / "tracker_baseline.json")
++    parser.add_argument("--visualization-output", type=Path, default=REPOSITORY_ROOT / "outputs" / "visualizations" / "tracker_demo.png")
++    args = parser.parse_args()
++
++    try:
++        config = _load_yaml(args.config)
++        tracker_config = config.get("tracker")
++        demo_config = config.get("demo")
++        if not isinstance(tracker_config, dict) or not isinstance(demo_config, dict):
++            raise ValueError("tracker config requires tracker and demo mappings")
++        num_frames = int(demo_config["num_frames"])
++        num_objects = int(demo_config["num_objects"])
++        measurement_std = float(demo_config["measurement_std"])
++        miss_probability = float(demo_config["miss_probability"])
++        association_distance = float(demo_config["association_distance"])
++        if num_frames < 2 or num_objects < 2 or measurement_std < 0.0 or not 0.0 <= miss_probability < 1.0:
++            raise ValueError("invalid synthetic demo parameters")
++
++        rng = np.random.default_rng(int(demo_config["random_seed"]))
++        initial_positions = np.asarray(((-8.0, -2.0, 0.0), (0.0, 3.0, 0.0), (8.0, -2.0, 0.0)))[:num_objects]
++        velocities = np.asarray(((0.30, 0.08, 0.0), (0.05, -0.12, 0.0), (-0.30, 0.08, 0.0)))[:num_objects]
++        truth_history = np.asarray(
++            [initial_positions + frame * velocities for frame in range(num_frames)],
++            dtype=np.float64,
++        )
++        tracker = MultiObjectTracker(
++            min_hits=int(tracker_config["min_hits"]),
++            max_age=int(tracker_config["max_age"]),
++            gating_threshold=float(tracker_config.get("gating_threshold", 9.21)),
++            initial_covariance=float(tracker_config.get("initial_covariance", 1.0)),
++            process_noise=float(tracker_config.get("process_noise", 0.01)),
++            measurement_noise=float(tracker_config.get("measurement_noise", 0.1)),
++        )
++        last_track_for_truth: dict[int, int] = {}
++        estimate_history: dict[int, list[tuple[float, float]]] = {}
++        false_positives = false_negatives = id_switches = id_true_positives = 0
++        total_truth = num_frames * num_objects
++
++        for frame_index, truth in enumerate(truth_history):
++            # 演示输入模拟真实 detector：高斯位置噪声 + 随机漏检。
++            detections = [
++                Detection3D(
++                    position=position + rng.normal(0.0, measurement_std, size=3),
++                    dimensions=np.ones(3),
++                    yaw=0.0,
++                    score=1.0,
++                    class_id=1,
++                )
++                for position in truth
++                if rng.random() >= miss_probability
++            ]
++            states = tracker.update(detections)
++            for state in states:
++                estimate_history.setdefault(state.track_id, []).append((float(state.state[0]), float(state.state[1])))
++            matches, unmatched_truth, unmatched_states = _match_positions(truth, states, association_distance)
++            # MOTA/IDF1/IDS 只统计已确认且本帧有观测更新的 TrackState。
++            false_negatives += len(unmatched_truth)
++            false_positives += len(unmatched_states)
++            id_true_positives += len(matches)
++            for truth_index, state_index in matches:
++                track_id = states[state_index].track_id
++                previous_track_id = last_track_for_truth.get(truth_index)
++                if previous_track_id is not None and previous_track_id != track_id:
++                    id_switches += 1
++                last_track_for_truth[truth_index] = track_id
++
++        mota = 1.0 - (false_negatives + false_positives + id_switches) / total_truth
++        idf1_denominator = 2 * id_true_positives + false_positives + false_negatives
++        idf1 = 0.0 if idf1_denominator == 0 else 2 * id_true_positives / idf1_denominator
++        metrics = {
++            "dataset": "synthetic_constant_velocity",
++            "num_frames": num_frames,
++            "num_objects": num_objects,
++            "measurement_std": measurement_std,
++            "miss_probability": miss_probability,
++            "false_positives": false_positives,
++            "false_negatives": false_negatives,
++            "id_true_positives": id_true_positives,
++            "ids": id_switches,
++            "MOTA": mota,
++            "IDF1": idf1,
++            "config": str(args.config),
++        }
++        args.metrics_output.parent.mkdir(parents=True, exist_ok=True)
++        args.metrics_output.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
++        _plot_trajectories(truth_history, estimate_history, args.visualization_output)
++    except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++
++    print(json.dumps(metrics, indent=2))
++    print(f"Saved metrics: {args.metrics_output}")
++    print(f"Saved visualization: {args.visualization_output}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/robot_perception/tracking/__init__.py b/src/robot_perception/tracking/__init__.py
+index 3144aa5..dbb3493 100644
+--- a/src/robot_perception/tracking/__init__.py
++++ b/src/robot_perception/tracking/__init__.py
+@@ -1,6 +1,8 @@
+ """Tracking primitives."""
+ 
+ from robot_perception.tracking.kalman import ConstantVelocityKalmanFilter, KalmanFilter
++from robot_perception.tracking.track import Track
++from robot_perception.tracking.tracker import MultiObjectTracker
+ from robot_perception.tracking.association import (
+     AssociationResult,
+     associate_detections_to_tracks,
+@@ -21,6 +23,8 @@ __all__ = [
+     "ConstantVelocityKalmanFilter",
+     "GatingResult",
+     "KalmanFilter",
++    "MultiObjectTracker",
++    "Track",
+     "associate_detections_to_tracks",
+     "euclidean_nearest_neighbor",
+     "gate_measurements",
+diff --git a/src/robot_perception/tracking/track.py b/src/robot_perception/tracking/track.py
+new file mode 100644
+index 0000000..2e691c6
+--- /dev/null
++++ b/src/robot_perception/tracking/track.py
+@@ -0,0 +1,123 @@
++"""Single-object track state and lifecycle management."""
++
++from __future__ import annotations
++
++import numpy as np
++
++from robot_perception.common.types import Detection3D, TrackState
++from robot_perception.tracking.kalman import ConstantVelocityKalmanFilter
++
++
++class Track:
++    """Wrap one constant-velocity KF and expose a track lifecycle."""
++
++    TENTATIVE = "Tentative"
++    CONFIRMED = "Confirmed"
++    LOST = "Lost"
++    DELETED = "Deleted"
++
++    def __init__(
++        self,
++        track_id: int,
++        detection: Detection3D,
++        *,
++        min_hits: int,
++        initial_covariance: np.ndarray | float,
++        process_noise: np.ndarray | float,
++        measurement_noise: np.ndarray | float,
++    ) -> None:
++        if track_id < 0:
++            raise ValueError("track_id must be non-negative")
++        if min_hits < 1:
++            raise ValueError("min_hits must be at least 1")
++        self.track_id = int(track_id)
++        self.min_hits = int(min_hits)
++        self._filter = ConstantVelocityKalmanFilter(
++            self._validate_detection(detection).position,
++            initial_covariance=initial_covariance,
++            process_noise=process_noise,
++            measurement_noise=measurement_noise,
++        )
++        self.dimensions = detection.dimensions.astype(np.float64, copy=True)
++        # KF 只估计位置和速度，尺寸/朝向/类别保留最近一次观测值。
++        self.yaw = float(detection.yaw)
++        self.score = float(detection.score)
++        self.class_id = int(detection.class_id)
++        self.age = 1
++        self.hits = 1
++        self.time_since_update = 0
++        self.status = self.CONFIRMED if min_hits == 1 else self.TENTATIVE
++
++    @staticmethod
++    def _validate_detection(detection: Detection3D) -> Detection3D:
++        if not isinstance(detection, Detection3D):
++            raise TypeError("track updates require Detection3D instances")
++        if detection.position.shape != (3,) or detection.dimensions.shape != (3,):
++            raise ValueError("Detection3D position and dimensions must have shape (3,)")
++        if not np.isfinite(detection.position).all() or not np.isfinite(detection.dimensions).all():
++            raise ValueError("Detection3D position and dimensions must be finite")
++        if (detection.dimensions <= 0.0).any() or not np.isfinite(detection.yaw):
++            raise ValueError("Detection3D dimensions must be positive and yaw finite")
++        return detection
++
++    @property
++    def state(self) -> np.ndarray:
++        return self._filter.state
++
++    @property
++    def covariance(self) -> np.ndarray:
++        return self._filter.covariance
++
++    @property
++    def measurement_noise(self) -> np.ndarray:
++        return self._filter.measurement_noise
++
++    def predict(self, dt: float = 1.0) -> np.ndarray:
++        """Predict one frame and age the track before association."""
++
++        if self.status == self.DELETED:
++            raise RuntimeError("cannot predict a deleted track")
++        # 每个 frame 先预测一次；若之后没有匹配，time_since_update 会继续保留。
++        self.age += 1
++        self.time_since_update += 1
++        return self._filter.predict(dt)
++
++    def update(self, detection: Detection3D) -> np.ndarray:
++        """Correct the KF and promote tentative/lost tracks when eligible."""
++
++        if self.status == self.DELETED:
++            raise RuntimeError("cannot update a deleted track")
++        detection = self._validate_detection(detection)
++        state = self._filter.update(detection.position)
++        self.dimensions = detection.dimensions.astype(np.float64, copy=True)
++        self.yaw = float(detection.yaw)
++        self.score = float(detection.score)
++        self.class_id = int(detection.class_id)
++        self.hits += 1
++        self.time_since_update = 0
++        if self.hits >= self.min_hits:
++            self.status = self.CONFIRMED
++        return state
++
++    def mark_missed(self, max_age: int) -> None:
++        """Move an unmatched track to Lost or Deleted based on missed age."""
++
++        if max_age < 1:
++            raise ValueError("max_age must be at least 1")
++        if self.status == self.DELETED:
++            return
++        # Lost 轨迹仍可在 max_age 内被后续观测恢复，超过窗口才永久删除。
++        self.status = self.DELETED if self.time_since_update >= max_age else self.LOST
++
++    def to_track_state(self) -> TrackState:
++        """Return the stable cross-module TrackState data contract."""
++
++        return TrackState(
++            track_id=self.track_id,
++            state=self.state,
++            covariance=self.covariance,
++            age=self.age,
++            hits=self.hits,
++            time_since_update=self.time_since_update,
++            status=self.status,
++        )
+diff --git a/src/robot_perception/tracking/tracker.py b/src/robot_perception/tracking/tracker.py
+new file mode 100644
+index 0000000..e8053c8
+--- /dev/null
++++ b/src/robot_perception/tracking/tracker.py
+@@ -0,0 +1,146 @@
++"""3D multi-object tracker built from the project's KF and association APIs."""
++
++from __future__ import annotations
++
++from collections.abc import Iterable
++from typing import Any
++
++import numpy as np
++
++from robot_perception.common.types import Detection3D, TrackState
++from robot_perception.tracking.association import AssociationResult, associate_detections_to_tracks
++from robot_perception.tracking.track import Track
++
++
++class MultiObjectTracker:
++    """Manage Track birth, association, aging, confirmation, and deletion."""
++
++    def __init__(
++        self,
++        *,
++        min_hits: int = 3,
++        max_age: int = 5,
++        gating_threshold: float = 9.21,
++        initial_covariance: np.ndarray | float = 1.0,
++        process_noise: np.ndarray | float = 1e-2,
++        measurement_noise: np.ndarray | float = 1e-1,
++    ) -> None:
++        if min_hits < 1 or max_age < 1:
++            raise ValueError("min_hits and max_age must be at least 1")
++        if not np.isfinite(gating_threshold) or gating_threshold < 0.0:
++            raise ValueError("gating_threshold must be finite and non-negative")
++        self.min_hits = int(min_hits)
++        self.max_age = int(max_age)
++        self.gating_threshold = float(gating_threshold)
++        self.initial_covariance = initial_covariance
++        self.process_noise = process_noise
++        # association 需要显式的 3x3 R；这里将 YAML 中常用的标量/对角向量展开。
++        self.measurement_noise = self._measurement_covariance(measurement_noise)
++        self._tracks: dict[int, Track] = {}
++        self._next_track_id = 1
++        self.frame_index = 0
++        self.last_association: AssociationResult | None = None
++
++    @staticmethod
++    def _measurement_covariance(value: Any) -> np.ndarray:
++        array = np.asarray(value, dtype=np.float64)
++        if array.ndim == 0:
++            matrix = np.eye(3, dtype=np.float64) * float(array)
++        elif array.shape == (3,):
++            matrix = np.diag(array)
++        elif array.shape == (3, 3):
++            matrix = array.copy()
++        else:
++            raise ValueError(f"measurement_noise must be scalar, (3,), or (3, 3), got {array.shape}")
++        if not np.isfinite(matrix).all() or (np.linalg.eigvalsh((matrix + matrix.T) * 0.5) < 0.0).any():
++            raise ValueError("measurement_noise must be finite and positive semidefinite")
++        return (matrix + matrix.T) * 0.5
++
++    @property
++    def tracks(self) -> tuple[Track, ...]:
++        """Return non-deleted tracks, including Lost tracks awaiting expiry."""
++
++        return tuple(track for track in self._tracks.values() if track.status != Track.DELETED)
++
++    @property
++    def all_tracks(self) -> tuple[Track, ...]:
++        """Return every track object, including deleted history for inspection."""
++
++        return tuple(self._tracks.values())
++
++    def predict(self, dt: float = 1.0) -> tuple[TrackState, ...]:
++        """Predict all active tracks without performing association."""
++
++        for track in self.tracks:
++            track.predict(dt)
++        return tuple(track.to_track_state() for track in self.tracks)
++
++    @staticmethod
++    def _validate_detections(detections: Iterable[Detection3D]) -> list[Detection3D]:
++        values = list(detections)
++        if any(not isinstance(detection, Detection3D) for detection in values):
++            raise TypeError("tracker input must contain Detection3D instances")
++        return values
++
++    def _create_track(self, detection: Detection3D) -> Track:
++        track = Track(
++            self._next_track_id,
++            detection,
++            min_hits=self.min_hits,
++            initial_covariance=self.initial_covariance,
++            process_noise=self.process_noise,
++            measurement_noise=self.measurement_noise,
++        )
++        self._tracks[track.track_id] = track
++        self._next_track_id += 1
++        return track
++
++    def update(self, detections: Iterable[Detection3D], *, dt: float = 1.0) -> list[TrackState]:
++        """Run one complete tracking frame and return confirmed TrackState values."""
++
++        observations = self._validate_detections(detections)
++        active_tracks = list(self.tracks)
++        # 使用列表快照保证本帧关联索引在新增/删除 Track 时仍保持稳定。
++        for track in active_tracks:
++            track.predict(dt)
++
++        if active_tracks:
++            states = np.stack([track.state for track in active_tracks])
++            covariances = np.stack([track.covariance for track in active_tracks])
++            detection_positions = (
++                np.stack([detection.position for detection in observations])
++                if observations
++                else np.empty((0, 3), dtype=np.float64)
++            )
++            association = associate_detections_to_tracks(
++                states,
++                covariances,
++                detection_positions,
++                measurement_noise=np.asarray(self.measurement_noise, dtype=np.float64),
++                gating_threshold=self.gating_threshold,
++            )
++        else:
++            association = AssociationResult(
++                matches=np.empty((0, 2), dtype=np.int64),
++                unmatched_tracks=np.empty(0, dtype=np.int64),
++                unmatched_detections=np.arange(len(observations), dtype=np.int64),
++            )
++        self.last_association = association
++
++        for track_index, detection_index in association.matches:
++            # association 返回的是 active_tracks 的局部索引，不是 Track ID。
++            active_tracks[int(track_index)].update(observations[int(detection_index)])
++        for track_index in association.unmatched_tracks:
++            active_tracks[int(track_index)].mark_missed(self.max_age)
++        for detection_index in association.unmatched_detections:
++            # 未匹配 detection 代表新目标，分配单调递增 ID。
++            self._create_track(observations[int(detection_index)])
++
++        self.frame_index += 1
++        return [
++            track.to_track_state()
++            for track in self.tracks
++            if track.status == Track.CONFIRMED and track.time_since_update == 0
++        ]
++
++    step = update
+diff --git a/tests/test_track.py b/tests/test_track.py
+new file mode 100644
+index 0000000..ea59ce9
+--- /dev/null
++++ b/tests/test_track.py
+@@ -0,0 +1,83 @@
++"""Tests for one Track lifecycle and state contract."""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from robot_perception.common.types import Detection3D
++from robot_perception.tracking import Track
++
++
++def _detection(position=(0.0, 0.0, 0.0), velocity=None) -> Detection3D:
++    return Detection3D(
++        position=np.asarray(position, dtype=np.float64),
++        dimensions=np.ones(3),
++        yaw=0.0,
++        score=0.9,
++        class_id=1,
++        velocity=None if velocity is None else np.asarray(velocity, dtype=np.float64),
++    )
++
++
++def _track(min_hits=3) -> Track:
++    return Track(
++        1,
++        _detection(),
++        min_hits=min_hits,
++        initial_covariance=np.eye(6),
++        process_noise=np.eye(6) * 1e-3,
++        measurement_noise=np.eye(3) * 1e-2,
++    )
++
++
++def test_new_track_starts_tentative_and_maintains_required_fields() -> None:
++    track = _track()
++
++    assert track.status == Track.TENTATIVE
++    assert track.track_id == 1
++    assert track.age == 1
++    assert track.hits == 1
++    assert track.time_since_update == 0
++    assert track.state.shape == (6,)
++    assert track.covariance.shape == (6, 6)
++
++
++def test_update_confirms_track_after_min_hits() -> None:
++    track = _track(min_hits=2)
++    track.predict()
++    track.update(_detection((1.0, 0.0, 0.0)))
++
++    assert track.status == Track.CONFIRMED
++    assert track.hits == 2
++    assert track.time_since_update == 0
++    assert track.state[0] > 0.0
++
++
++def test_missed_track_becomes_lost_then_deleted() -> None:
++    track = _track(min_hits=1)
++    track.predict()
++    track.mark_missed(max_age=2)
++    assert track.status == Track.LOST
++    track.predict()
++    track.mark_missed(max_age=2)
++    assert track.status == Track.DELETED
++
++
++def test_deleted_track_cannot_be_reused() -> None:
++    track = _track()
++    track.predict()
++    track.mark_missed(max_age=1)
++
++    with pytest.raises(RuntimeError):
++        track.predict()
++    with pytest.raises(RuntimeError):
++        track.update(_detection())
++
++
++def test_invalid_detection_is_rejected() -> None:
++    track = _track()
++    invalid = Detection3D(np.zeros(2), np.ones(3), 0.0, 0.9, 1)
++
++    with pytest.raises(ValueError):
++        track.update(invalid)
+diff --git a/tests/test_tracker.py b/tests/test_tracker.py
+new file mode 100644
+index 0000000..d0115cf
+--- /dev/null
++++ b/tests/test_tracker.py
+@@ -0,0 +1,109 @@
++"""Tests for complete 3D multi-object tracker frame updates."""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from robot_perception.common.types import Detection3D
++from robot_perception.tracking import MultiObjectTracker, Track
++
++
++def _detection(position, class_id=1) -> Detection3D:
++    return Detection3D(np.asarray(position, dtype=np.float64), np.ones(3), 0.0, 1.0, class_id)
++
++
++def _tracker(**kwargs: object) -> MultiObjectTracker:
++    return MultiObjectTracker(
++        min_hits=kwargs.pop("min_hits", 1),
++        max_age=kwargs.pop("max_age", 3),
++        gating_threshold=kwargs.pop("gating_threshold", 16.0),
++        initial_covariance=np.eye(6),
++        process_noise=np.eye(6) * 1e-3,
++        measurement_noise=np.eye(3) * 1e-2,
++        **kwargs,
++    )
++
++
++def test_single_object_is_created_and_updated() -> None:
++    tracker = _tracker()
++    first = tracker.update([_detection((0.0, 0.0, 0.0))])
++    second = tracker.update([_detection((1.0, 0.0, 0.0))])
++
++    assert len(first) == 1
++    assert len(second) == 1
++    assert first[0].track_id == second[0].track_id == 1
++    assert second[0].state[0] > 0.0
++
++
++def test_multiple_objects_keep_distinct_ids() -> None:
++    tracker = _tracker()
++    states = tracker.update([_detection((0.0, 0.0, 0.0)), _detection((10.0, 0.0, 0.0))])
++
++    assert [state.track_id for state in states] == [1, 2]
++    assert len({state.track_id for state in states}) == 2
++
++
++def test_new_object_birth_gets_new_monotonic_id() -> None:
++    tracker = _tracker()
++    tracker.update([_detection((0.0, 0.0, 0.0))])
++    states = tracker.update([_detection((0.5, 0.0, 0.0)), _detection((20.0, 0.0, 0.0))])
++
++    assert [state.track_id for state in states] == [1, 2]
++    assert tracker.all_tracks[-1].track_id == 2
++
++
++def test_temporary_missed_detection_keeps_track_then_recovers() -> None:
++    tracker = _tracker(max_age=3)
++    tracker.update([_detection((0.0, 0.0, 0.0))])
++    assert tracker.update([]) == []
++    recovered = tracker.update([_detection((1.0, 0.0, 0.0))])
++
++    assert len(recovered) == 1
++    assert recovered[0].track_id == 1
++    assert tracker.all_tracks[0].status == Track.CONFIRMED
++
++
++def test_track_is_deleted_after_permanent_disappearance() -> None:
++    tracker = _tracker(max_age=2)
++    tracker.update([_detection((0.0, 0.0, 0.0))])
++    tracker.update([])
++    tracker.update([])
++
++    assert tracker.tracks == ()
++    assert tracker.all_tracks[0].status == Track.DELETED
++
++
++def test_deleted_id_is_not_reused_for_later_birth() -> None:
++    tracker = _tracker(max_age=1)
++    tracker.update([_detection((0.0, 0.0, 0.0))])
++    tracker.update([])
++    states = tracker.update([_detection((50.0, 0.0, 0.0))])
++
++    assert [state.track_id for state in states] == [2]
++    assert [track.track_id for track in tracker.all_tracks] == [1, 2]
++
++
++def test_crossing_trajectories_keep_ids_with_motion_prediction() -> None:
++    tracker = _tracker(gating_threshold=25.0)
++    frames = [
++        [_detection((-2.0, 0.0, 0.0)), _detection((2.0, 0.0, 0.0))],
++        [_detection((-1.0, 0.0, 0.0)), _detection((1.0, 0.0, 0.0))],
++        [_detection((-0.1, 0.0, 0.0)), _detection((0.1, 0.0, 0.0))],
++        [_detection((1.0, 0.0, 0.0)), _detection((-1.0, 0.0, 0.0))],
++    ]
++    first = tracker.update(frames[0])
++    ids = {round(state.state[0], 1): state.track_id for state in first}
++    for detections in frames[1:]:
++        states = tracker.update(detections)
++        assert len(states) == 2
++
++    assert len(ids) == 2
++    assert {state.track_id for state in states} == {1, 2}
++
++
++def test_tracker_rejects_non_detection_input() -> None:
++    tracker = _tracker()
++
++    with pytest.raises(TypeError):
++        tracker.update([np.zeros(3)])
