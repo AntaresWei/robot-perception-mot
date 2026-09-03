@@ -1,0 +1,19 @@
+# 变更清单
+
+基线 `026884fa37250462305a80094452fb2fca4e7016` → 当前工作区 ｜ 6 个文件，+713 / -7
+
+```
+62	6	README.md
+7	0	configs/fusion.yaml
+137	0	scripts/run_fusion_demo.py
+25	1	src/robot_perception/fusion/__init__.py
+347	0	src/robot_perception/fusion/camera_lidar.py
+135	0	tests/test_fusion.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- configs/fusion.yaml
+- scripts/run_fusion_demo.py
+- src/robot_perception/fusion/camera_lidar.py
+- tests/test_fusion.py

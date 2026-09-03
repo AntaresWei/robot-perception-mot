@@ -1,0 +1,7 @@
+fusion:
+  iou_threshold: 0.10
+  center_distance_threshold: 80.0
+  camera_detector: synthetic_gt
+  camera_score_threshold: 0.0
+  camera_bbox_noise_std: 0.0
+  random_seed: 7

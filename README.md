@@ -48,7 +48,8 @@ pip install numpy==1.26.4 scipy==1.11.4 opencv-python open3d pyyaml \
 不会影响 `robot-perception-mot`：
 
 以下步骤已经在本机验证过。不要把这些依赖安装到 `robot-perception-mot`，
-因为官方 `mmdetection3d-1.0.0rc6` 依赖旧版 PyTorch/MMCV。
+因为官方 `mmdetection3d-1.0.0rc6` 依赖旧版 PyTorch/MMCV。推荐从仓库根目录
+执行，所有相对路径都以仓库根目录为基准。
 
 ```bash
 source /data/weijiaman/miniconda3/etc/profile.d/conda.sh
@@ -70,6 +71,15 @@ pip install -v -e ./mmdetection3d-1.0
 unset HTTP_PROXY HTTPS_PROXY
 ```
 
+如果本地没有官方源码，先获取对应 tag，再执行上面的 editable install：
+
+```bash
+git clone --branch v1.0.0rc6 --depth 1 \
+  https://github.com/open-mmlab/mmdetection3d.git mmdetection3d-1.0
+```
+
+不要使用当前 `main` 分支替代 `v1.0.0rc6`，否则配置和 API 可能不兼容。
+
 安装完成后可保存环境快照，便于以后重建：
 
 ```bash
@@ -89,7 +99,7 @@ NumPy 1.20.3
 Pillow 9.5.0
 ```
 
-验证版本：
+验证版本（必须在 `mmdet3d-kitti` 环境中执行）：
 
 ```bash
 python -c "import torch,mmcv,mmdet,mmdet3d,numpy,PIL; print(\
@@ -97,7 +107,16 @@ torch.__version__, torch.version.cuda, mmcv.__version__, mmdet.__version__,\
 mmdet3d.__version__, numpy.__version__, PIL.__version__)"
 ```
 
-预期版本为 `1.10.0+cu113 1.6.0 2.28.2 1.0.0rc6 1.20.3 9.5.0`。
+预期版本为：
+
+```text
+torch       1.10.0+cu113  (CUDA runtime 11.3)
+mmcv        1.6.0
+mmdet       2.28.2
+mmdet3d     1.0.0rc6
+numpy       1.20.3
+Pillow      9.5.0
+```
 
 ### PointPillars 文件
 
@@ -118,6 +137,14 @@ test -f mmdetection3d-1.0/configs/pointpillars/hv_pointpillars_secfpn_6x8_160e_k
 test -f hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth
 ```
 
+三分类 checkpoint 下载地址（官方 model zoo）：
+
+```text
+https://download.openmmlab.com/mmdetection3d/v1.0.0_models/pointpillars/
+hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class/
+hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth
+```
+
 该 checkpoint 的官方类别顺序是 `Pedestrian, Cyclist, Car`，项目映射为：
 
 ```text
@@ -129,7 +156,8 @@ model label 2 -> Car        -> project class_id 1
 ### 环境验证与单帧推理
 
 先确认驱动和 GPU 可见。建议先选择空闲卡；例如设置
-`CUDA_VISIBLE_DEVICES=6` 后，进程内的 `cuda:0` 就是物理 GPU 6：
+`CUDA_VISIBLE_DEVICES=6` 后，进程内的 `cuda:0` 就是物理 GPU 6。主机驱动
+可以是 CUDA 12.8，但该环境的 PyTorch/预编译 MMCV 仍固定使用 cu113：
 
 ```bash
 nvidia-smi -L
@@ -138,8 +166,8 @@ CUDA_VISIBLE_DEVICES=6 python -c \
   torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-如果 `torch.cuda.is_available()` 为 `False`，先检查 `nvidia-smi` 和当前
-容器/终端是否能访问 NVIDIA 驱动，不要修改模型代码。
+如果 `torch.cuda.is_available()` 为 `False`，先检查 `nvidia-smi`、GPU 是否
+被其他进程占满，以及当前容器/终端是否能访问 NVIDIA 驱动，不要修改模型代码。
 
 验证官方 demo：
 
@@ -172,6 +200,10 @@ Cyclist 3，score 范围约为 `0.3206-0.8429`。官方原始输出为 13 个 bo
 阈值 `0.3` 后保留 12 个。项目 adapter 不修改 Tracker，只负责将
 `boxes_3d/scores_3d/labels_3d` 转为统一 `Detection3D`。
 
+建议将一次验证记录到实验日志：环境版本、GPU、配置路径、checkpoint 路径、
+score threshold、输出数量和推理耗时。这样重建环境或更换 GPU 后可以区分模型
+差异与运行环境差异。
+
 ### 常见问题
 
 - `ModuleNotFoundError: mmdet`：确认已激活 `mmdet3d-kitti`，并从仓库根目录执行；检查 `pip show mmdet`。
@@ -179,6 +211,7 @@ Cyclist 3，score 范围约为 `0.3206-0.8429`。官方原始输出为 13 个 bo
 - `CUDA out of memory`：先用 `nvidia-smi` 选择空闲 GPU，再设置 `CUDA_VISIBLE_DEVICES`；不要直接终止其他任务。
 - 不要在 `robot-perception-mot` 中安装 `mmcv-full 1.6.0`；它面向 PyTorch 1.10/cu113，和主环境不兼容。
 - `CUDA version mismatches`：不要用系统 CUDA 12.x 编译旧版 MMCV；优先使用上面的 `cu113/torch1.10` 预编译 wheel。
+- `mmdet3d` 导入失败：确认当前目录是仓库根目录，且 `mmdetection3d-1.0` 已按 `v1.0.0rc6` editable install。
 
 ## Verification
 
@@ -213,6 +246,29 @@ MMDetection3D `boxes_3d`, `scores_3d`, and `labels_3d` into the same contract.
 The GT adapters are controlled inputs for tracker validation. **GT-based
 tracking experiments validate only the tracking implementation and must not be
 reported as detector performance.**
+
+## Camera-LiDAR Fusion
+
+当前实现是 object-level fusion，分为三个明确阶段：
+
+1. **Projection**：`project_detection_to_image()` 将 LiDAR 3D box 投影为
+   图像中的 2D bounding box。Projection 只做几何变换，不能单独称为 Fusion。
+2. **Cross-modal association**：使用 class ID、2D IoU 和 bbox center distance
+   将 LiDAR box 与 Camera 2D detection 做一对一匹配。
+3. **Sensor fusion**：匹配成功后生成 `FusedDetection`，保留
+   `lidar_detection`、`camera_detection`、`fusion_confidence` 和 `track_id`。
+
+由于当前没有稳定的 Camera detector，`SyntheticCameraDetector` 使用 KITTI
+2D 标注作为 mock 输入，仅用于验证 Fusion 流程，不代表 Camera detector 性能。
+
+运行可视化 demo：
+
+```bash
+python scripts/run_fusion_demo.py --sequence 0000 --frame 100
+```
+
+输出保存到 `outputs/visualizations/fusion_0000_000100.png`，绿色点为投影
+LiDAR，绿色框为 3D box 的图像投影，蓝色框为 Camera 2D detection。
 
 ## Status
 
