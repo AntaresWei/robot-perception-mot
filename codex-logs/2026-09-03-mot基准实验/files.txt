@@ -1,0 +1,17 @@
+# 变更清单
+
+基线 `8c9be185d82818439b64cafea6f65dd727560b18` → 当前工作区 ｜ 5 个文件，+673 / -0
+
+```
+18	0	README.md
+12	0	configs/pipeline.yaml
+35	0	docs/experiments.md
+547	0	scripts/evaluate.py
+61	0	tests/test_evaluate.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- docs/experiments.md
+- scripts/evaluate.py
+- tests/test_evaluate.py

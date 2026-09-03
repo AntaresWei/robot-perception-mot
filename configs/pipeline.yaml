@@ -1,5 +1,17 @@
 dataset_config: configs/dataset.yaml
 tracker_config: configs/tracker.yaml
+detector_config: configs/detector.yaml
+
+benchmark:
+  start_frame: 0
+  end_frame: -1
+  # GT/NoisyGT 只用于验证 tracking/association，不代表 detector 性能。
+  detector_type: gt
+  evaluation_distance_threshold: 2.0
+  association_distance: 3.0
+  tracker_min_hits: 1
+  output_dir: outputs/metrics
+  plot: true
 
 pointcloud:
   voxel_size: 0.10

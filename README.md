@@ -258,6 +258,24 @@ reported as detector performance.**
 3. **Sensor fusion**：匹配成功后生成 `FusedDetection`，保留
    `lidar_detection`、`camera_detection`、`fusion_confidence` 和 `track_id`。
 
+## MOT Benchmark
+
+`scripts/evaluate.py` 在同一 KITTI sequence、帧范围和预计算 detection stream
+上比较三种 tracking 方法：`baseline_nn`（无 Kalman 的 Euclidean nearest
+neighbor）、`baseline_kf`（Kalman + Euclidean）和 `proposed`（Kalman +
+Mahalanobis gating + Hungarian）。配置位于 `configs/pipeline.yaml`，结果自动写入
+`outputs/metrics/baseline_nn.json`、`baseline_kf.json`、`proposed.json`，并生成
+`mot_comparison.png` 和 `docs/experiments.md`：
+
+```bash
+/data/weijiaman/miniconda3/envs/robot-perception-mot/bin/python scripts/evaluate.py \
+  --config configs/pipeline.yaml --sequence 0000
+```
+
+当前已实际运行 sequence `0000` 的 154 帧。默认 `detector_type: gt` 只用于
+tracking pipeline validation，因此结果不能解释为 detector 性能；真实
+PointPillars benchmark 需要单独准备 detector runtime 和输入适配。
+
 ## ROS2 Humble Replay
 
 `ros2_ws/src/perception_tracker` 提供一个 replay-oriented ROS2 节点，将现有
@@ -315,8 +333,13 @@ python scripts/ros2_smoke_test.py
 python scripts/run_fusion_demo.py --sequence 0000 --frame 100
 ```
 
-输出保存到 `outputs/visualizations/fusion_0000_000100.png`，绿色点为投影
-LiDAR，绿色框为 3D box 的图像投影，蓝色框为 Camera 2D detection。
+`configs/fusion.yaml` 的 `visualization.lidar_points_mode` 支持 `raw`、
+`non_ground`、`none`。`raw` 直接投影 `FrameData.lidar_points`，用于 calibration
+debug；`non_ground` 使用完整预处理流水线的 `non_ground_points`，适用于最终
+perception/fusion demo；`none` 只显示 object-level fusion box。每次都输出同一帧的
+`fusion_<sequence>_<frame>_raw.png` 和 `fusion_<sequence>_<frame>_non_ground.png`
+供人工对比，并按配置输出主图。投影点以 rectified camera depth 的 TURBO 色表着色，
+不再使用固定绿色；绿色框仍是 3D box 图像投影，蓝色框是 Camera 2D detection。
 
 ## Status
 

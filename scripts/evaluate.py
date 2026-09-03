@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""Run reproducible KITTI tracking baselines and generate experiment reports.
+
+The three methods consume one precomputed detection stream per invocation:
+
+* ``baseline_nn``: position -> Euclidean nearest-neighbor (no Kalman filter)
+* ``baseline_kf``: Kalman prediction -> Euclidean nearest-neighbor
+* ``proposed``: Kalman prediction -> Mahalanobis gating -> Hungarian
+
+The script deliberately keeps benchmark-only tracker wrappers here.  The
+project's production ``MultiObjectTracker`` remains unchanged and reusable.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import argparse
+import json
+from pathlib import Path
+import resource
+import subprocess
+import sys
+import time
+from typing import Any, Iterable
+
+import numpy as np
+
+try:
+    import yaml
+except ImportError as error:  # pragma: no cover - documented environment dependency
+    raise RuntimeError("PyYAML is required by scripts/evaluate.py") from error
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from robot_perception.common.types import Detection3D, FrameData  # noqa: E402
+from robot_perception.dataset import KittiTrackingDataset  # noqa: E402
+from robot_perception.detection import GTDetector, NoisyGTDetector  # noqa: E402
+from robot_perception.detection.base import KITTI_CLASS_IDS  # noqa: E402
+from robot_perception.tracking import MultiObjectTracker, Track  # noqa: E402
+from robot_perception.tracking.association import euclidean_nearest_neighbor, hungarian_association  # noqa: E402
+
+
+@dataclass(frozen=True)
+class DetectionRecord:
+    """One detector output and its matched KITTI identity for benchmark setup."""
+
+    detection: Detection3D
+    gt_track_id: int | None
+
+
+@dataclass(frozen=True)
+class TruthObject:
+    """The minimal ground-truth fields needed for frame-level MOT metrics."""
+
+    track_id: int
+    class_id: int
+    position: np.ndarray
+
+
+@dataclass(frozen=True)
+class TrackObservation:
+    """A benchmark track snapshot independent of the production data model."""
+
+    track_id: int
+    class_id: int
+    position: np.ndarray
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as stream:
+        value = yaml.safe_load(stream) or {}
+    if not isinstance(value, dict):
+        raise ValueError(f"configuration root must be a mapping: {path}")
+    return value
+
+
+def _resolve_config_path(path_value: str, base: Path = REPO_ROOT) -> Path:
+    path = Path(path_value)
+    return path if path.is_absolute() else base / path
+
+
+def _git_commit_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "NOT AVAILABLE"
+
+
+def _make_detector(detector_config: dict[str, Any], benchmark_config: dict[str, Any]) -> Any:
+    detector = detector_config.get("detector", detector_config)
+    detector_type = str(benchmark_config.get("detector_type", detector.get("type", "gt"))).lower()
+    score_threshold = float(detector.get("score_threshold", 0.0))
+    class_ids = detector.get("class_ids", [1, 2, 3])
+    if detector_type == "gt":
+        return GTDetector(score_threshold=score_threshold, class_ids=class_ids)
+    if detector_type in {"noisy_gt", "noisy-gt"}:
+        noise = detector.get("noise", {})
+        return NoisyGTDetector(
+            position_std=noise.get("position_std", 0.0),
+            dimensions_std=noise.get("dimensions_std", 0.0),
+            yaw_std=noise.get("yaw_std", 0.0),
+            score_std=noise.get("score_std", 0.0),
+            random_seed=noise.get("random_seed"),
+            score_threshold=score_threshold,
+            class_ids=class_ids,
+        )
+    raise ValueError(
+        "benchmark supports GT/NoisyGT detector inputs only; "
+        f"got {detector_type!r}. Real detector benchmark is NOT RUN."
+    )
+
+
+def _truth_for_frame(frame: FrameData) -> list[TruthObject]:
+    truth: list[TruthObject] = []
+    for annotation in frame.annotations or []:
+        class_id = KITTI_CLASS_IDS.get(annotation.class_name)
+        if class_id is None or class_id > 3:
+            continue
+        position = np.asarray(annotation.location, dtype=np.float64)
+        if position.shape == (3,) and np.isfinite(position).all():
+            truth.append(TruthObject(annotation.track_id, class_id, position.copy()))
+    return truth
+
+
+def _records_for_frame(frame: FrameData, detector: Any) -> list[DetectionRecord]:
+    detections = detector.predict(frame)
+    annotations = [
+        annotation
+        for annotation in (frame.annotations or [])
+        if KITTI_CLASS_IDS.get(annotation.class_name) in {1, 2, 3}
+    ]
+    # Noisy detectors preserve annotation order, but nearest unused GT matching
+    # keeps this mapping correct for adapters that reorder model outputs.
+    unused = set(range(len(annotations)))
+    records: list[DetectionRecord] = []
+    for detection in detections:
+        candidates = [
+            index
+            for index in unused
+            if KITTI_CLASS_IDS.get(annotations[index].class_name) == detection.class_id
+        ]
+        if not candidates:
+            records.append(DetectionRecord(detection, None))
+            continue
+        nearest = min(candidates, key=lambda index: float(np.linalg.norm(
+            np.asarray(annotations[index].location, dtype=np.float64) - detection.position
+        )))
+        unused.remove(nearest)
+        records.append(DetectionRecord(detection, annotations[nearest].track_id))
+    return records
+
+
+class NearestNeighborBaseline:
+    """Simple no-KF tracker used only as Baseline A."""
+
+    def __init__(self, *, max_age: int, association_distance: float) -> None:
+        self.max_age = int(max_age)
+        self.association_distance = float(association_distance)
+        self._tracks: dict[int, dict[str, Any]] = {}
+        self._next_id = 1
+
+    def update(self, detections: list[Detection3D]) -> list[TrackObservation]:
+        active = list(self._tracks.items())
+        positions = np.asarray([item[1]["position"] for item in active], dtype=np.float64).reshape(-1, 3)
+        observations = np.asarray([detection.position for detection in detections], dtype=np.float64).reshape(-1, 3)
+        association = euclidean_nearest_neighbor(
+            positions, observations, max_distance=self.association_distance
+        ) if active and detections else None
+        matched_tracks: set[int] = set()
+        matched_detections: set[int] = set()
+        if association is not None:
+            for track_index, detection_index in association.matches:
+                track_id = active[int(track_index)][0]
+                detection = detections[int(detection_index)]
+                self._tracks[track_id].update(position=detection.position.copy(), class_id=detection.class_id, missed=0)
+                matched_tracks.add(track_id)
+                matched_detections.add(int(detection_index))
+        for track_id, track in active:
+            if track_id in matched_tracks:
+                continue
+            track["missed"] += 1
+            if track["missed"] >= self.max_age:
+                self._tracks.pop(track_id, None)
+        for index, detection in enumerate(detections):
+            if index in matched_detections:
+                continue
+            self._tracks[self._next_id] = {
+                "position": detection.position.astype(np.float64, copy=True),
+                "class_id": int(detection.class_id),
+                "missed": 0,
+            }
+            self._next_id += 1
+        return [
+            TrackObservation(track_id, int(track["class_id"]), np.asarray(track["position"]).copy())
+            for track_id, track in self._tracks.items()
+            if track["missed"] == 0
+        ]
+
+
+class EuclideanKalmanBaseline:
+    """KF prediction plus Euclidean assignment used as Baseline B."""
+
+    def __init__(self, *, tracker_config: dict[str, Any], association_distance: float, min_hits: int | None = None) -> None:
+        config = tracker_config.get("tracker", tracker_config)
+        self.max_age = int(config.get("max_age", 5))
+        self.min_hits = int(config.get("min_hits", 1) if min_hits is None else min_hits)
+        self.association_distance = float(association_distance)
+        self.initial_covariance = config.get("initial_covariance", 1.0)
+        self.process_noise = config.get("process_noise", 0.01)
+        self.measurement_noise = config.get("measurement_noise", 0.1)
+        self._tracks: dict[int, Track] = {}
+        self._next_id = 1
+
+    def update(self, detections: list[Detection3D]) -> list[TrackObservation]:
+        active = list(self._tracks.values())
+        for track in active:
+            track.predict(1.0)
+        positions = np.stack([track.state[:3] for track in active]) if active else np.empty((0, 3))
+        observations = np.stack([detection.position for detection in detections]) if detections else np.empty((0, 3))
+        association = euclidean_nearest_neighbor(
+            positions, observations, max_distance=self.association_distance
+        ) if active and detections else None
+        matched_tracks: set[int] = set()
+        matched_detections: set[int] = set()
+        if association is not None:
+            for track_index, detection_index in association.matches:
+                track = active[int(track_index)]
+                track.update(detections[int(detection_index)])
+                matched_tracks.add(track.track_id)
+                matched_detections.add(int(detection_index))
+        for track in active:
+            if track.track_id not in matched_tracks:
+                track.mark_missed(self.max_age)
+        for index, detection in enumerate(detections):
+            if index in matched_detections:
+                continue
+            self._tracks[self._next_id] = Track(
+                self._next_id,
+                detection,
+                min_hits=self.min_hits,
+                initial_covariance=self.initial_covariance,
+                process_noise=self.process_noise,
+                measurement_noise=self.measurement_noise,
+            )
+            self._next_id += 1
+        self._tracks = {track_id: track for track_id, track in self._tracks.items() if track.status != Track.DELETED}
+        return [
+            TrackObservation(track.track_id, track.class_id, track.state[:3].copy())
+            for track in self._tracks.values()
+            if track.status == Track.CONFIRMED and track.time_since_update == 0
+        ]
+
+
+class ProposedTracker:
+    """Adapter exposing production MultiObjectTracker as observations."""
+
+    def __init__(self, tracker_config: dict[str, Any], *, min_hits: int | None = None) -> None:
+        config = tracker_config.get("tracker", tracker_config)
+        self.tracker = MultiObjectTracker(
+            min_hits=int(config.get("min_hits", 1) if min_hits is None else min_hits),
+            max_age=int(config.get("max_age", 5)),
+            gating_threshold=float(config.get("gating_threshold", 9.21)),
+            initial_covariance=config.get("initial_covariance", 1.0),
+            process_noise=config.get("process_noise", 0.01),
+            measurement_noise=config.get("measurement_noise", 0.1),
+        )
+
+    def update(self, detections: list[Detection3D]) -> list[TrackObservation]:
+        self.tracker.update(detections)
+        return [
+            TrackObservation(track.track_id, track.class_id, track.state[:3].copy())
+            for track in self.tracker.tracks
+            if track.status == Track.CONFIRMED and track.time_since_update == 0
+        ]
+
+
+def _match_frame(
+    truth: list[TruthObject],
+    predictions: list[TrackObservation],
+    distance_threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not truth or not predictions:
+        return np.empty((0, 2), dtype=np.int64), np.arange(len(truth)), np.arange(len(predictions))
+    costs = np.full((len(truth), len(predictions)), np.inf, dtype=np.float64)
+    for truth_index, target in enumerate(truth):
+        for prediction_index, prediction in enumerate(predictions):
+            if target.class_id == prediction.class_id:
+                costs[truth_index, prediction_index] = np.linalg.norm(target.position - prediction.position)
+    association = hungarian_association(
+        costs,
+        valid_mask=np.isfinite(costs) & (costs <= distance_threshold),
+    )
+    return association.matches, association.unmatched_tracks, association.unmatched_detections
+
+
+def compute_metrics(
+    truths: list[list[TruthObject]],
+    predictions: list[list[TrackObservation]],
+    *,
+    distance_threshold: float,
+) -> dict[str, float | int]:
+    """Compute frame-level MOTA/IDF1 and identity switches from actual tracks."""
+
+    if len(truths) != len(predictions):
+        raise ValueError("truth and prediction frame counts must match")
+    total_gt = total_fp = total_fn = total_ids = idtp = 0
+    previous_assignment: dict[int, int] = {}
+    for frame_truth, frame_predictions in zip(truths, predictions):
+        matches, unmatched_truth, unmatched_predictions = _match_frame(
+            frame_truth, frame_predictions, distance_threshold
+        )
+        total_gt += len(frame_truth)
+        total_fn += len(unmatched_truth)
+        total_fp += len(unmatched_predictions)
+        idtp += len(matches)
+        for truth_index, prediction_index in matches:
+            gt_id = frame_truth[int(truth_index)].track_id
+            predicted_id = frame_predictions[int(prediction_index)].track_id
+            previous = previous_assignment.get(gt_id)
+            if previous is not None and previous != predicted_id:
+                total_ids += 1
+            previous_assignment[gt_id] = predicted_id
+    denominator = max(total_gt, 1)
+    idf1_denominator = 2 * idtp + total_fp + total_fn
+    return {
+        "MOTA": float(1.0 - (total_fn + total_fp + total_ids) / denominator),
+        "IDF1": float(2.0 * idtp / idf1_denominator) if idf1_denominator else 0.0,
+        "IDS": int(total_ids),
+        "FP": int(total_fp),
+        "FN": int(total_fn),
+        "GT": int(total_gt),
+        "matches": int(idtp),
+    }
+
+
+def _run_method(
+    name: str,
+    tracker: Any,
+    detection_frames: list[list[DetectionRecord]],
+    truth_frames: list[list[TruthObject]],
+    distance_threshold: float,
+) -> tuple[dict[str, Any], list[list[TrackObservation]]]:
+    start = time.perf_counter()
+    predictions: list[list[TrackObservation]] = []
+    for records in detection_frames:
+        predictions.append(tracker.update([record.detection for record in records]))
+    elapsed = max(time.perf_counter() - start, np.finfo(float).eps)
+    metrics = compute_metrics(truth_frames, predictions, distance_threshold=distance_threshold)
+    num_frames = len(detection_frames)
+    metrics["runtime_seconds"] = float(elapsed)
+    metrics["latency_ms_per_frame"] = float(elapsed * 1000.0 / max(num_frames, 1))
+    metrics["FPS"] = float(num_frames / elapsed) if num_frames else 0.0
+    # Linux ru_maxrss 的单位是 KiB；只读取进程峰值，不引入额外依赖。
+    metrics["cpu_peak_rss_mb"] = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0)
+    metrics["gpu_memory_mb"] = None
+    metrics["gpu_memory_status"] = "NOT RUN (GT detector input)"
+    return {"method": name, "metrics": metrics}, predictions
+
+
+def _write_plots(results: dict[str, dict[str, Any]], output_dir: Path) -> list[str]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return []
+    names = list(results)
+    labels = [name.replace("_", " ").title() for name in names]
+    figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for axis, metric, title in zip(axes, ("MOTA", "IDF1", "IDS"), ("MOTA comparison", "IDF1 comparison", "IDS comparison")):
+        values = [results[name]["metrics"][metric] for name in names]
+        bars = axis.bar(labels, values, color=["#4C78A8", "#F58518", "#54A24B"])
+        axis.set_title(title)
+        axis.tick_params(axis="x", rotation=25)
+        for bar, value in zip(bars, values):
+            axis.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:.3f}", ha="center", va="bottom")
+    figure.tight_layout()
+    path = output_dir / "mot_comparison.png"
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+    return [str(path)]
+
+
+def _write_report(
+    report_path: Path,
+    results: dict[str, dict[str, Any]],
+    *,
+    sequence: str,
+    frame_range: tuple[int, int],
+    config_paths: dict[str, str],
+    timestamp: str,
+) -> None:
+    lines = [
+        "# MOT 实验报告",
+        "",
+        "本报告由 `scripts/evaluate.py` 自动生成，指标来自实际运行结果，不手工填写。",
+        "",
+        "## Configuration",
+        "",
+        f"- Git commit: `{_git_commit_hash()}`",
+        f"- Dataset sequence: `{sequence}`",
+        f"- Frame range: `{frame_range[0]}..{frame_range[1]}`",
+        f"- Timestamp (UTC): `{timestamp}`",
+        f"- Config: `{json.dumps(config_paths, ensure_ascii=False)}`",
+        "",
+        "## Metrics",
+        "",
+        "| Method | MOTA | IDF1 | IDS | FP | FN | FPS | latency/frame (ms) | CPU peak RSS (MB) |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for name, result in results.items():
+        metrics = result["metrics"]
+        lines.append(
+            f"| {name} | {metrics['MOTA']:.4f} | {metrics['IDF1']:.4f} | {metrics['IDS']} | "
+            f"{metrics['FP']} | {metrics['FN']} | {metrics['FPS']:.2f} | {metrics['latency_ms_per_frame']:.3f} | {metrics['cpu_peak_rss_mb']:.2f} |"
+        )
+    lines.extend([
+        "",
+        "## Runtime",
+        "",
+        "每个方法在同一预计算 detection stream 上独立运行；FPS 和 latency 只统计 tracker/association，",
+        "不包含 KITTI 文件解码和 detector 推理。GPU memory: NOT RUN（本实验使用 GT detector）。",
+        "",
+        "## Observations",
+        "",
+        "- Baseline A 不使用 Kalman prediction，容易在漏检、交叉或临近目标场景中丢失轨迹。",
+        "- Baseline B 使用 Kalman，但 Euclidean cost 未使用协方差；Proposed 还包含 Mahalanobis gating 和 Hungarian 一对一关联。",
+        "- GT/NoisyGT detector 仅用于验证 tracking pipeline，不能解释为 detector accuracy、mAP 或 recall。",
+        "",
+        "## Limitations",
+        "",
+        "- 当前 IDF1 是按帧位置匹配得到的可复现实验基线，不替代完整 MOTChallenge 全局 ID 指标实现。",
+        "- 若配置真实 detector，脚本会拒绝运行并明确标记 NOT RUN，避免伪造结果。",
+    ])
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_benchmark(config_path: Path, sequence: str, start_frame: int | None, end_frame: int | None) -> dict[str, Any]:
+    pipeline = _load_yaml(config_path)
+    dataset_path = _resolve_config_path(str(pipeline.get("dataset_config", "configs/dataset.yaml")))
+    tracker_path = _resolve_config_path(str(pipeline.get("tracker_config", "configs/tracker.yaml")))
+    detector_path = _resolve_config_path(str(pipeline.get("detector_config", "configs/detector.yaml")))
+    dataset_config = _load_yaml(dataset_path).get("dataset", {})
+    tracker_config = _load_yaml(tracker_path)
+    detector_config = _load_yaml(detector_path)
+    benchmark = pipeline.get("benchmark", {})
+    configured_start = int(benchmark.get("start_frame", 0))
+    configured_end = int(benchmark.get("end_frame", -1))
+    first_frame = configured_start if start_frame is None else int(start_frame)
+    last_frame = configured_end if end_frame is None else int(end_frame)
+    dataset_root = _resolve_config_path(str(dataset_config.get("root", "data")))
+    dataset = KittiTrackingDataset(
+        dataset_root,
+        split=str(dataset_config.get("split", "training")),
+        sequences=[sequence],
+        load_images=False,
+        load_annotations=True,
+    )
+    selected_indices = [
+        index for index in range(len(dataset))
+        if dataset._frame_keys[index].frame_id >= first_frame
+        and (last_frame < 0 or dataset._frame_keys[index].frame_id <= last_frame)
+    ]
+    if not selected_indices:
+        raise ValueError(f"no frames selected for sequence={sequence}, range={first_frame}..{last_frame}")
+    detector = _make_detector(detector_config, benchmark)
+    detection_frames: list[list[DetectionRecord]] = []
+    truth_frames: list[list[TruthObject]] = []
+    actual_frame_ids: list[int] = []
+    for index in selected_indices:
+        frame = dataset[index]
+        detection_frames.append(_records_for_frame(frame, detector))
+        truth_frames.append(_truth_for_frame(frame))
+        actual_frame_ids.append(frame.frame_id)
+
+    association_distance = float(benchmark.get("association_distance", 3.0))
+    evaluation_distance = float(benchmark.get("evaluation_distance_threshold", 2.0))
+    tracker_settings = tracker_config.get("tracker", tracker_config)
+    benchmark_min_hits = int(benchmark.get("tracker_min_hits", tracker_settings.get("min_hits", 1)))
+    results: dict[str, dict[str, Any]] = {}
+    method_specs = (
+        ("baseline_nn", NearestNeighborBaseline(max_age=int(tracker_settings.get("max_age", 5)), association_distance=association_distance)),
+        ("baseline_kf", EuclideanKalmanBaseline(tracker_config=tracker_config, association_distance=association_distance, min_hits=benchmark_min_hits)),
+        ("proposed", ProposedTracker(tracker_config, min_hits=benchmark_min_hits)),
+    )
+    for name, tracker in method_specs:
+        result, _ = _run_method(name, tracker, detection_frames, truth_frames, evaluation_distance)
+        result.update({
+            "dataset_sequence": str(sequence),
+            "frame_range": {"start": int(actual_frame_ids[0]), "end": int(actual_frame_ids[-1])},
+            "num_frames": len(actual_frame_ids),
+            "detection_input": str(benchmark.get("detector_type", detector_config.get("detector", {}).get("type", "gt"))),
+            "config": {
+                "pipeline": pipeline,
+                "dataset": dataset_config,
+                "detector": detector_config,
+                "tracker": tracker_config,
+                "benchmark": benchmark,
+            },
+            "git_commit_hash": _git_commit_hash(),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "status": "OK",
+        })
+        results[name] = result
+
+    output_dir = _resolve_config_path(str(benchmark.get("output_dir", "outputs/metrics")))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name, result in results.items():
+        (output_dir / f"{name}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    if bool(benchmark.get("plot", True)):
+        _write_plots(results, output_dir)
+    report_path = REPO_ROOT / "docs" / "experiments.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    _write_report(
+        report_path,
+        results,
+        sequence=str(sequence),
+        frame_range=(actual_frame_ids[0], actual_frame_ids[-1]),
+        config_paths={"pipeline": str(config_path), "dataset": str(dataset_path), "detector": str(detector_path), "tracker": str(tracker_path)},
+        timestamp=timestamp,
+    )
+    return results
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Evaluate KITTI MOT baselines and generate reports")
+    parser.add_argument("--config", default="configs/pipeline.yaml", type=Path)
+    parser.add_argument("--sequence", default="0000")
+    parser.add_argument("--start-frame", type=int, default=None)
+    parser.add_argument("--end-frame", type=int, default=None)
+    args = parser.parse_args(argv)
+    config_path = args.config if args.config.is_absolute() else REPO_ROOT / args.config
+    results = run_benchmark(config_path, args.sequence, args.start_frame, args.end_frame)
+    print("Method       MOTA      IDF1      IDS   FP   FN   FPS")
+    for name, result in results.items():
+        metrics = result["metrics"]
+        print(f"{name:<12} {metrics['MOTA']:.4f}  {metrics['IDF1']:.4f}  {metrics['IDS']:>5} {metrics['FP']:>4} {metrics['FN']:>4} {metrics['FPS']:.2f}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

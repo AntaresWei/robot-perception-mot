@@ -5,3 +5,11 @@ fusion:
   camera_score_threshold: 0.0
   camera_bbox_noise_std: 0.0
   random_seed: 7
+
+visualization:
+  # raw 用于 calibration debug；最终 perception/fusion demo 推荐 non_ground。
+  lidar_points_mode: raw
+  max_projected_points: 20000
+  point_radius: 1
+  # 使用 rectified camera depth 的百分位映射 TURBO 色表，避免极远点压缩颜色对比。
+  depth_percentiles: [2.0, 98.0]
