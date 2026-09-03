@@ -1,0 +1,1404 @@
+diff --git a/.gitignore b/.gitignore
+index 0940220..0c94bf2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -70,4 +70,4 @@ dist/
+ # =====================
+ JMODT-main/
+ codex-log-kit/
+-mmdetection3d-1.0/
++mmdetection3d-1.0/**
+diff --git a/README.md b/README.md
+index 1b2e84e..76ee6f1 100644
+--- a/README.md
++++ b/README.md
+@@ -258,6 +258,24 @@ reported as detector performance.**
+ 3. **Sensor fusion**：匹配成功后生成 `FusedDetection`，保留
+    `lidar_detection`、`camera_detection`、`fusion_confidence` 和 `track_id`。
+ 
++## MOT Benchmark
++
++`scripts/evaluate.py` 在同一 KITTI sequence、帧范围和预计算 detection stream
++上比较三种 tracking 方法：`baseline_nn`（无 Kalman 的 Euclidean nearest
++neighbor）、`baseline_kf`（Kalman + Euclidean）和 `proposed`（Kalman +
++Mahalanobis gating + Hungarian）。配置位于 `configs/pipeline.yaml`，结果自动写入
++`outputs/metrics/baseline_nn.json`、`baseline_kf.json`、`proposed.json`，并生成
++`mot_comparison.png` 和 `docs/experiments.md`：
++
++```bash
++/data/weijiaman/miniconda3/envs/robot-perception-mot/bin/python scripts/evaluate.py \
++  --config configs/pipeline.yaml --sequence 0000
++```
++
++当前已实际运行 sequence `0000` 的 154 帧。默认 `detector_type: gt` 只用于
++tracking pipeline validation，因此结果不能解释为 detector 性能；真实
++PointPillars benchmark 需要单独准备 detector runtime 和输入适配。
++
+ ## ROS2 Humble Replay
+ 
+ `ros2_ws/src/perception_tracker` 提供一个 replay-oriented ROS2 节点，将现有
+@@ -315,8 +333,23 @@ python scripts/ros2_smoke_test.py
+ python scripts/run_fusion_demo.py --sequence 0000 --frame 100
+ ```
+ 
+-输出保存到 `outputs/visualizations/fusion_0000_000100.png`，绿色点为投影
+-LiDAR，绿色框为 3D box 的图像投影，蓝色框为 Camera 2D detection。
++`configs/fusion.yaml` 的 `visualization.lidar_points_mode` 支持 `raw`、
++`non_ground`、`none`。`raw` 直接投影 `FrameData.lidar_points`，用于 calibration
++debug；`non_ground` 使用完整预处理流水线的 `non_ground_points`，适用于最终
++perception/fusion demo；`none` 只显示 object-level fusion box。每次都输出同一帧的
++`fusion_<sequence>_<frame>_raw.png` 和 `fusion_<sequence>_<frame>_non_ground.png`
++供人工对比，并按配置输出主图。投影点以 rectified camera depth 的 TURBO 色表着色，
++不再使用固定绿色；绿色框仍是 3D box 图像投影，蓝色框是 Camera 2D detection。
++
++将 sequence 离线写为 MP4（默认 `non_ground`，共用每帧最终 fusion visual） ：
++
++```bash
++python scripts/render_fusion_video.py --sequence 0000
++```
++
++默认输出为 `outputs/videos/fusion_0000_non_ground.mp4`。可用
++`--lidar-points-mode raw` 生成 calibration debug 视频，或通过 `--fps`、
++`--start-frame` 和 `--end-frame` 调整离线渲染范围。
+ 
+ ## Status
+ 
+diff --git a/configs/fusion.yaml b/configs/fusion.yaml
+index 16b8964..ac1c00d 100644
+--- a/configs/fusion.yaml
++++ b/configs/fusion.yaml
+@@ -5,3 +5,14 @@ fusion:
+   camera_score_threshold: 0.0
+   camera_bbox_noise_std: 0.0
+   random_seed: 7
++
++visualization:
++  # raw 用于 calibration debug；最终 perception/fusion demo 推荐 non_ground。
++  lidar_points_mode: raw
++  max_projected_points: 20000
++  point_radius: 1
++  # 使用 rectified camera depth 的百分位映射 TURBO 色表，避免极远点压缩颜色对比。
++  depth_percentiles: [2.0, 98.0]
++  # 离线视频默认展示最终用于 perception/fusion demo 的非地面点。
++  video_lidar_points_mode: non_ground
++  video_fps: 10.0
+diff --git a/configs/pipeline.yaml b/configs/pipeline.yaml
+index cf4fe47..e1250b4 100644
+--- a/configs/pipeline.yaml
++++ b/configs/pipeline.yaml
+@@ -1,5 +1,17 @@
+ dataset_config: configs/dataset.yaml
+ tracker_config: configs/tracker.yaml
++detector_config: configs/detector.yaml
++
++benchmark:
++  start_frame: 0
++  end_frame: -1
++  # GT/NoisyGT 只用于验证 tracking/association，不代表 detector 性能。
++  detector_type: gt
++  evaluation_distance_threshold: 2.0
++  association_distance: 3.0
++  tracker_min_hits: 1
++  output_dir: outputs/metrics
++  plot: true
+ 
+ pointcloud:
+   voxel_size: 0.10
+diff --git a/docs/experiments.md b/docs/experiments.md
+new file mode 100644
+index 0000000..658398f
+--- /dev/null
++++ b/docs/experiments.md
+@@ -0,0 +1,35 @@
++# MOT 实验报告
++
++本报告由 `scripts/evaluate.py` 自动生成，指标来自实际运行结果，不手工填写。
++
++## Configuration
++
++- Git commit: `8c9be185d82818439b64cafea6f65dd727560b18`
++- Dataset sequence: `0000`
++- Frame range: `0..153`
++- Timestamp (UTC): `2026-09-03T05:53:20.860119+00:00`
++- Config: `{"pipeline": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/pipeline.yaml", "dataset": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/dataset.yaml", "detector": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/detector.yaml", "tracker": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/tracker.yaml"}`
++
++## Metrics
++
++| Method | MOTA | IDF1 | IDS | FP | FN | FPS | latency/frame (ms) | CPU peak RSS (MB) |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
++| baseline_nn | 1.0000 | 1.0000 | 0 | 0 | 0 | 6766.61 | 0.148 | 68.17 |
++| baseline_kf | 1.0000 | 1.0000 | 0 | 0 | 0 | 1364.61 | 0.733 | 68.17 |
++| proposed | 1.0000 | 1.0000 | 0 | 0 | 0 | 912.12 | 1.096 | 68.17 |
++
++## Runtime
++
++每个方法在同一预计算 detection stream 上独立运行；FPS 和 latency 只统计 tracker/association，
++不包含 KITTI 文件解码和 detector 推理。GPU memory: NOT RUN（本实验使用 GT detector）。
++
++## Observations
++
++- Baseline A 不使用 Kalman prediction，容易在漏检、交叉或临近目标场景中丢失轨迹。
++- Baseline B 使用 Kalman，但 Euclidean cost 未使用协方差；Proposed 还包含 Mahalanobis gating 和 Hungarian 一对一关联。
++- GT/NoisyGT detector 仅用于验证 tracking pipeline，不能解释为 detector accuracy、mAP 或 recall。
++
++## Limitations
++
++- 当前 IDF1 是按帧位置匹配得到的可复现实验基线，不替代完整 MOTChallenge 全局 ID 指标实现。
++- 若配置真实 detector，脚本会拒绝运行并明确标记 NOT RUN，避免伪造结果。
+diff --git a/scripts/evaluate.py b/scripts/evaluate.py
+new file mode 100644
+index 0000000..386f7d0
+--- /dev/null
++++ b/scripts/evaluate.py
+@@ -0,0 +1,547 @@
++#!/usr/bin/env python3
++"""Run reproducible KITTI tracking baselines and generate experiment reports.
++
++The three methods consume one precomputed detection stream per invocation:
++
++* ``baseline_nn``: position -> Euclidean nearest-neighbor (no Kalman filter)
++* ``baseline_kf``: Kalman prediction -> Euclidean nearest-neighbor
++* ``proposed``: Kalman prediction -> Mahalanobis gating -> Hungarian
++
++The script deliberately keeps benchmark-only tracker wrappers here.  The
++project's production ``MultiObjectTracker`` remains unchanged and reusable.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime, timezone
++import argparse
++import json
++from pathlib import Path
++import resource
++import subprocess
++import sys
++import time
++from typing import Any, Iterable
++
++import numpy as np
++
++try:
++    import yaml
++except ImportError as error:  # pragma: no cover - documented environment dependency
++    raise RuntimeError("PyYAML is required by scripts/evaluate.py") from error
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++SRC_DIR = REPO_ROOT / "src"
++if str(SRC_DIR) not in sys.path:
++    sys.path.insert(0, str(SRC_DIR))
++
++from robot_perception.common.types import Detection3D, FrameData  # noqa: E402
++from robot_perception.dataset import KittiTrackingDataset  # noqa: E402
++from robot_perception.detection import GTDetector, NoisyGTDetector  # noqa: E402
++from robot_perception.detection.base import KITTI_CLASS_IDS  # noqa: E402
++from robot_perception.tracking import MultiObjectTracker, Track  # noqa: E402
++from robot_perception.tracking.association import euclidean_nearest_neighbor, hungarian_association  # noqa: E402
++
++
++@dataclass(frozen=True)
++class DetectionRecord:
++    """One detector output and its matched KITTI identity for benchmark setup."""
++
++    detection: Detection3D
++    gt_track_id: int | None
++
++
++@dataclass(frozen=True)
++class TruthObject:
++    """The minimal ground-truth fields needed for frame-level MOT metrics."""
++
++    track_id: int
++    class_id: int
++    position: np.ndarray
++
++
++@dataclass(frozen=True)
++class TrackObservation:
++    """A benchmark track snapshot independent of the production data model."""
++
++    track_id: int
++    class_id: int
++    position: np.ndarray
++
++
++def _load_yaml(path: Path) -> dict[str, Any]:
++    with path.open("r", encoding="utf-8") as stream:
++        value = yaml.safe_load(stream) or {}
++    if not isinstance(value, dict):
++        raise ValueError(f"configuration root must be a mapping: {path}")
++    return value
++
++
++def _resolve_config_path(path_value: str, base: Path = REPO_ROOT) -> Path:
++    path = Path(path_value)
++    return path if path.is_absolute() else base / path
++
++
++def _git_commit_hash() -> str:
++    try:
++        return subprocess.check_output(
++            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL
++        ).strip()
++    except (OSError, subprocess.CalledProcessError):
++        return "NOT AVAILABLE"
++
++
++def _make_detector(detector_config: dict[str, Any], benchmark_config: dict[str, Any]) -> Any:
++    detector = detector_config.get("detector", detector_config)
++    detector_type = str(benchmark_config.get("detector_type", detector.get("type", "gt"))).lower()
++    score_threshold = float(detector.get("score_threshold", 0.0))
++    class_ids = detector.get("class_ids", [1, 2, 3])
++    if detector_type == "gt":
++        return GTDetector(score_threshold=score_threshold, class_ids=class_ids)
++    if detector_type in {"noisy_gt", "noisy-gt"}:
++        noise = detector.get("noise", {})
++        return NoisyGTDetector(
++            position_std=noise.get("position_std", 0.0),
++            dimensions_std=noise.get("dimensions_std", 0.0),
++            yaw_std=noise.get("yaw_std", 0.0),
++            score_std=noise.get("score_std", 0.0),
++            random_seed=noise.get("random_seed"),
++            score_threshold=score_threshold,
++            class_ids=class_ids,
++        )
++    raise ValueError(
++        "benchmark supports GT/NoisyGT detector inputs only; "
++        f"got {detector_type!r}. Real detector benchmark is NOT RUN."
++    )
++
++
++def _truth_for_frame(frame: FrameData) -> list[TruthObject]:
++    truth: list[TruthObject] = []
++    for annotation in frame.annotations or []:
++        class_id = KITTI_CLASS_IDS.get(annotation.class_name)
++        if class_id is None or class_id > 3:
++            continue
++        position = np.asarray(annotation.location, dtype=np.float64)
++        if position.shape == (3,) and np.isfinite(position).all():
++            truth.append(TruthObject(annotation.track_id, class_id, position.copy()))
++    return truth
++
++
++def _records_for_frame(frame: FrameData, detector: Any) -> list[DetectionRecord]:
++    detections = detector.predict(frame)
++    annotations = [
++        annotation
++        for annotation in (frame.annotations or [])
++        if KITTI_CLASS_IDS.get(annotation.class_name) in {1, 2, 3}
++    ]
++    # Noisy detectors preserve annotation order, but nearest unused GT matching
++    # keeps this mapping correct for adapters that reorder model outputs.
++    unused = set(range(len(annotations)))
++    records: list[DetectionRecord] = []
++    for detection in detections:
++        candidates = [
++            index
++            for index in unused
++            if KITTI_CLASS_IDS.get(annotations[index].class_name) == detection.class_id
++        ]
++        if not candidates:
++            records.append(DetectionRecord(detection, None))
++            continue
++        nearest = min(candidates, key=lambda index: float(np.linalg.norm(
++            np.asarray(annotations[index].location, dtype=np.float64) - detection.position
++        )))
++        unused.remove(nearest)
++        records.append(DetectionRecord(detection, annotations[nearest].track_id))
++    return records
++
++
++class NearestNeighborBaseline:
++    """Simple no-KF tracker used only as Baseline A."""
++
++    def __init__(self, *, max_age: int, association_distance: float) -> None:
++        self.max_age = int(max_age)
++        self.association_distance = float(association_distance)
++        self._tracks: dict[int, dict[str, Any]] = {}
++        self._next_id = 1
++
++    def update(self, detections: list[Detection3D]) -> list[TrackObservation]:
++        active = list(self._tracks.items())
++        positions = np.asarray([item[1]["position"] for item in active], dtype=np.float64).reshape(-1, 3)
++        observations = np.asarray([detection.position for detection in detections], dtype=np.float64).reshape(-1, 3)
++        association = euclidean_nearest_neighbor(
++            positions, observations, max_distance=self.association_distance
++        ) if active and detections else None
++        matched_tracks: set[int] = set()
++        matched_detections: set[int] = set()
++        if association is not None:
++            for track_index, detection_index in association.matches:
++                track_id = active[int(track_index)][0]
++                detection = detections[int(detection_index)]
++                self._tracks[track_id].update(position=detection.position.copy(), class_id=detection.class_id, missed=0)
++                matched_tracks.add(track_id)
++                matched_detections.add(int(detection_index))
++        for track_id, track in active:
++            if track_id in matched_tracks:
++                continue
++            track["missed"] += 1
++            if track["missed"] >= self.max_age:
++                self._tracks.pop(track_id, None)
++        for index, detection in enumerate(detections):
++            if index in matched_detections:
++                continue
++            self._tracks[self._next_id] = {
++                "position": detection.position.astype(np.float64, copy=True),
++                "class_id": int(detection.class_id),
++                "missed": 0,
++            }
++            self._next_id += 1
++        return [
++            TrackObservation(track_id, int(track["class_id"]), np.asarray(track["position"]).copy())
++            for track_id, track in self._tracks.items()
++            if track["missed"] == 0
++        ]
++
++
++class EuclideanKalmanBaseline:
++    """KF prediction plus Euclidean assignment used as Baseline B."""
++
++    def __init__(self, *, tracker_config: dict[str, Any], association_distance: float, min_hits: int | None = None) -> None:
++        config = tracker_config.get("tracker", tracker_config)
++        self.max_age = int(config.get("max_age", 5))
++        self.min_hits = int(config.get("min_hits", 1) if min_hits is None else min_hits)
++        self.association_distance = float(association_distance)
++        self.initial_covariance = config.get("initial_covariance", 1.0)
++        self.process_noise = config.get("process_noise", 0.01)
++        self.measurement_noise = config.get("measurement_noise", 0.1)
++        self._tracks: dict[int, Track] = {}
++        self._next_id = 1
++
++    def update(self, detections: list[Detection3D]) -> list[TrackObservation]:
++        active = list(self._tracks.values())
++        for track in active:
++            track.predict(1.0)
++        positions = np.stack([track.state[:3] for track in active]) if active else np.empty((0, 3))
++        observations = np.stack([detection.position for detection in detections]) if detections else np.empty((0, 3))
++        association = euclidean_nearest_neighbor(
++            positions, observations, max_distance=self.association_distance
++        ) if active and detections else None
++        matched_tracks: set[int] = set()
++        matched_detections: set[int] = set()
++        if association is not None:
++            for track_index, detection_index in association.matches:
++                track = active[int(track_index)]
++                track.update(detections[int(detection_index)])
++                matched_tracks.add(track.track_id)
++                matched_detections.add(int(detection_index))
++        for track in active:
++            if track.track_id not in matched_tracks:
++                track.mark_missed(self.max_age)
++        for index, detection in enumerate(detections):
++            if index in matched_detections:
++                continue
++            self._tracks[self._next_id] = Track(
++                self._next_id,
++                detection,
++                min_hits=self.min_hits,
++                initial_covariance=self.initial_covariance,
++                process_noise=self.process_noise,
++                measurement_noise=self.measurement_noise,
++            )
++            self._next_id += 1
++        self._tracks = {track_id: track for track_id, track in self._tracks.items() if track.status != Track.DELETED}
++        return [
++            TrackObservation(track.track_id, track.class_id, track.state[:3].copy())
++            for track in self._tracks.values()
++            if track.status == Track.CONFIRMED and track.time_since_update == 0
++        ]
++
++
++class ProposedTracker:
++    """Adapter exposing production MultiObjectTracker as observations."""
++
++    def __init__(self, tracker_config: dict[str, Any], *, min_hits: int | None = None) -> None:
++        config = tracker_config.get("tracker", tracker_config)
++        self.tracker = MultiObjectTracker(
++            min_hits=int(config.get("min_hits", 1) if min_hits is None else min_hits),
++            max_age=int(config.get("max_age", 5)),
++            gating_threshold=float(config.get("gating_threshold", 9.21)),
++            initial_covariance=config.get("initial_covariance", 1.0),
++            process_noise=config.get("process_noise", 0.01),
++            measurement_noise=config.get("measurement_noise", 0.1),
++        )
++
++    def update(self, detections: list[Detection3D]) -> list[TrackObservation]:
++        self.tracker.update(detections)
++        return [
++            TrackObservation(track.track_id, track.class_id, track.state[:3].copy())
++            for track in self.tracker.tracks
++            if track.status == Track.CONFIRMED and track.time_since_update == 0
++        ]
++
++
++def _match_frame(
++    truth: list[TruthObject],
++    predictions: list[TrackObservation],
++    distance_threshold: float,
++) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    if not truth or not predictions:
++        return np.empty((0, 2), dtype=np.int64), np.arange(len(truth)), np.arange(len(predictions))
++    costs = np.full((len(truth), len(predictions)), np.inf, dtype=np.float64)
++    for truth_index, target in enumerate(truth):
++        for prediction_index, prediction in enumerate(predictions):
++            if target.class_id == prediction.class_id:
++                costs[truth_index, prediction_index] = np.linalg.norm(target.position - prediction.position)
++    association = hungarian_association(
++        costs,
++        valid_mask=np.isfinite(costs) & (costs <= distance_threshold),
++    )
++    return association.matches, association.unmatched_tracks, association.unmatched_detections
++
++
++def compute_metrics(
++    truths: list[list[TruthObject]],
++    predictions: list[list[TrackObservation]],
++    *,
++    distance_threshold: float,
++) -> dict[str, float | int]:
++    """Compute frame-level MOTA/IDF1 and identity switches from actual tracks."""
++
++    if len(truths) != len(predictions):
++        raise ValueError("truth and prediction frame counts must match")
++    total_gt = total_fp = total_fn = total_ids = idtp = 0
++    previous_assignment: dict[int, int] = {}
++    for frame_truth, frame_predictions in zip(truths, predictions):
++        matches, unmatched_truth, unmatched_predictions = _match_frame(
++            frame_truth, frame_predictions, distance_threshold
++        )
++        total_gt += len(frame_truth)
++        total_fn += len(unmatched_truth)
++        total_fp += len(unmatched_predictions)
++        idtp += len(matches)
++        for truth_index, prediction_index in matches:
++            gt_id = frame_truth[int(truth_index)].track_id
++            predicted_id = frame_predictions[int(prediction_index)].track_id
++            previous = previous_assignment.get(gt_id)
++            if previous is not None and previous != predicted_id:
++                total_ids += 1
++            previous_assignment[gt_id] = predicted_id
++    denominator = max(total_gt, 1)
++    idf1_denominator = 2 * idtp + total_fp + total_fn
++    return {
++        "MOTA": float(1.0 - (total_fn + total_fp + total_ids) / denominator),
++        "IDF1": float(2.0 * idtp / idf1_denominator) if idf1_denominator else 0.0,
++        "IDS": int(total_ids),
++        "FP": int(total_fp),
++        "FN": int(total_fn),
++        "GT": int(total_gt),
++        "matches": int(idtp),
++    }
++
++
++def _run_method(
++    name: str,
++    tracker: Any,
++    detection_frames: list[list[DetectionRecord]],
++    truth_frames: list[list[TruthObject]],
++    distance_threshold: float,
++) -> tuple[dict[str, Any], list[list[TrackObservation]]]:
++    start = time.perf_counter()
++    predictions: list[list[TrackObservation]] = []
++    for records in detection_frames:
++        predictions.append(tracker.update([record.detection for record in records]))
++    elapsed = max(time.perf_counter() - start, np.finfo(float).eps)
++    metrics = compute_metrics(truth_frames, predictions, distance_threshold=distance_threshold)
++    num_frames = len(detection_frames)
++    metrics["runtime_seconds"] = float(elapsed)
++    metrics["latency_ms_per_frame"] = float(elapsed * 1000.0 / max(num_frames, 1))
++    metrics["FPS"] = float(num_frames / elapsed) if num_frames else 0.0
++    # Linux ru_maxrss 的单位是 KiB；只读取进程峰值，不引入额外依赖。
++    metrics["cpu_peak_rss_mb"] = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0)
++    metrics["gpu_memory_mb"] = None
++    metrics["gpu_memory_status"] = "NOT RUN (GT detector input)"
++    return {"method": name, "metrics": metrics}, predictions
++
++
++def _write_plots(results: dict[str, dict[str, Any]], output_dir: Path) -> list[str]:
++    try:
++        import matplotlib.pyplot as plt
++    except ImportError:
++        return []
++    names = list(results)
++    labels = [name.replace("_", " ").title() for name in names]
++    figure, axes = plt.subplots(1, 3, figsize=(12, 4))
++    for axis, metric, title in zip(axes, ("MOTA", "IDF1", "IDS"), ("MOTA comparison", "IDF1 comparison", "IDS comparison")):
++        values = [results[name]["metrics"][metric] for name in names]
++        bars = axis.bar(labels, values, color=["#4C78A8", "#F58518", "#54A24B"])
++        axis.set_title(title)
++        axis.tick_params(axis="x", rotation=25)
++        for bar, value in zip(bars, values):
++            axis.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:.3f}", ha="center", va="bottom")
++    figure.tight_layout()
++    path = output_dir / "mot_comparison.png"
++    figure.savefig(path, dpi=150)
++    plt.close(figure)
++    return [str(path)]
++
++
++def _write_report(
++    report_path: Path,
++    results: dict[str, dict[str, Any]],
++    *,
++    sequence: str,
++    frame_range: tuple[int, int],
++    config_paths: dict[str, str],
++    timestamp: str,
++) -> None:
++    lines = [
++        "# MOT 实验报告",
++        "",
++        "本报告由 `scripts/evaluate.py` 自动生成，指标来自实际运行结果，不手工填写。",
++        "",
++        "## Configuration",
++        "",
++        f"- Git commit: `{_git_commit_hash()}`",
++        f"- Dataset sequence: `{sequence}`",
++        f"- Frame range: `{frame_range[0]}..{frame_range[1]}`",
++        f"- Timestamp (UTC): `{timestamp}`",
++        f"- Config: `{json.dumps(config_paths, ensure_ascii=False)}`",
++        "",
++        "## Metrics",
++        "",
++        "| Method | MOTA | IDF1 | IDS | FP | FN | FPS | latency/frame (ms) | CPU peak RSS (MB) |",
++        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
++    ]
++    for name, result in results.items():
++        metrics = result["metrics"]
++        lines.append(
++            f"| {name} | {metrics['MOTA']:.4f} | {metrics['IDF1']:.4f} | {metrics['IDS']} | "
++            f"{metrics['FP']} | {metrics['FN']} | {metrics['FPS']:.2f} | {metrics['latency_ms_per_frame']:.3f} | {metrics['cpu_peak_rss_mb']:.2f} |"
++        )
++    lines.extend([
++        "",
++        "## Runtime",
++        "",
++        "每个方法在同一预计算 detection stream 上独立运行；FPS 和 latency 只统计 tracker/association，",
++        "不包含 KITTI 文件解码和 detector 推理。GPU memory: NOT RUN（本实验使用 GT detector）。",
++        "",
++        "## Observations",
++        "",
++        "- Baseline A 不使用 Kalman prediction，容易在漏检、交叉或临近目标场景中丢失轨迹。",
++        "- Baseline B 使用 Kalman，但 Euclidean cost 未使用协方差；Proposed 还包含 Mahalanobis gating 和 Hungarian 一对一关联。",
++        "- GT/NoisyGT detector 仅用于验证 tracking pipeline，不能解释为 detector accuracy、mAP 或 recall。",
++        "",
++        "## Limitations",
++        "",
++        "- 当前 IDF1 是按帧位置匹配得到的可复现实验基线，不替代完整 MOTChallenge 全局 ID 指标实现。",
++        "- 若配置真实 detector，脚本会拒绝运行并明确标记 NOT RUN，避免伪造结果。",
++    ])
++    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
++def run_benchmark(config_path: Path, sequence: str, start_frame: int | None, end_frame: int | None) -> dict[str, Any]:
++    pipeline = _load_yaml(config_path)
++    dataset_path = _resolve_config_path(str(pipeline.get("dataset_config", "configs/dataset.yaml")))
++    tracker_path = _resolve_config_path(str(pipeline.get("tracker_config", "configs/tracker.yaml")))
++    detector_path = _resolve_config_path(str(pipeline.get("detector_config", "configs/detector.yaml")))
++    dataset_config = _load_yaml(dataset_path).get("dataset", {})
++    tracker_config = _load_yaml(tracker_path)
++    detector_config = _load_yaml(detector_path)
++    benchmark = pipeline.get("benchmark", {})
++    configured_start = int(benchmark.get("start_frame", 0))
++    configured_end = int(benchmark.get("end_frame", -1))
++    first_frame = configured_start if start_frame is None else int(start_frame)
++    last_frame = configured_end if end_frame is None else int(end_frame)
++    dataset_root = _resolve_config_path(str(dataset_config.get("root", "data")))
++    dataset = KittiTrackingDataset(
++        dataset_root,
++        split=str(dataset_config.get("split", "training")),
++        sequences=[sequence],
++        load_images=False,
++        load_annotations=True,
++    )
++    selected_indices = [
++        index for index in range(len(dataset))
++        if dataset._frame_keys[index].frame_id >= first_frame
++        and (last_frame < 0 or dataset._frame_keys[index].frame_id <= last_frame)
++    ]
++    if not selected_indices:
++        raise ValueError(f"no frames selected for sequence={sequence}, range={first_frame}..{last_frame}")
++    detector = _make_detector(detector_config, benchmark)
++    detection_frames: list[list[DetectionRecord]] = []
++    truth_frames: list[list[TruthObject]] = []
++    actual_frame_ids: list[int] = []
++    for index in selected_indices:
++        frame = dataset[index]
++        detection_frames.append(_records_for_frame(frame, detector))
++        truth_frames.append(_truth_for_frame(frame))
++        actual_frame_ids.append(frame.frame_id)
++
++    association_distance = float(benchmark.get("association_distance", 3.0))
++    evaluation_distance = float(benchmark.get("evaluation_distance_threshold", 2.0))
++    tracker_settings = tracker_config.get("tracker", tracker_config)
++    benchmark_min_hits = int(benchmark.get("tracker_min_hits", tracker_settings.get("min_hits", 1)))
++    results: dict[str, dict[str, Any]] = {}
++    method_specs = (
++        ("baseline_nn", NearestNeighborBaseline(max_age=int(tracker_settings.get("max_age", 5)), association_distance=association_distance)),
++        ("baseline_kf", EuclideanKalmanBaseline(tracker_config=tracker_config, association_distance=association_distance, min_hits=benchmark_min_hits)),
++        ("proposed", ProposedTracker(tracker_config, min_hits=benchmark_min_hits)),
++    )
++    for name, tracker in method_specs:
++        result, _ = _run_method(name, tracker, detection_frames, truth_frames, evaluation_distance)
++        result.update({
++            "dataset_sequence": str(sequence),
++            "frame_range": {"start": int(actual_frame_ids[0]), "end": int(actual_frame_ids[-1])},
++            "num_frames": len(actual_frame_ids),
++            "detection_input": str(benchmark.get("detector_type", detector_config.get("detector", {}).get("type", "gt"))),
++            "config": {
++                "pipeline": pipeline,
++                "dataset": dataset_config,
++                "detector": detector_config,
++                "tracker": tracker_config,
++                "benchmark": benchmark,
++            },
++            "git_commit_hash": _git_commit_hash(),
++            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++            "status": "OK",
++        })
++        results[name] = result
++
++    output_dir = _resolve_config_path(str(benchmark.get("output_dir", "outputs/metrics")))
++    output_dir.mkdir(parents=True, exist_ok=True)
++    for name, result in results.items():
++        (output_dir / f"{name}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
++    if bool(benchmark.get("plot", True)):
++        _write_plots(results, output_dir)
++    report_path = REPO_ROOT / "docs" / "experiments.md"
++    report_path.parent.mkdir(parents=True, exist_ok=True)
++    timestamp = datetime.now(timezone.utc).isoformat()
++    _write_report(
++        report_path,
++        results,
++        sequence=str(sequence),
++        frame_range=(actual_frame_ids[0], actual_frame_ids[-1]),
++        config_paths={"pipeline": str(config_path), "dataset": str(dataset_path), "detector": str(detector_path), "tracker": str(tracker_path)},
++        timestamp=timestamp,
++    )
++    return results
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description="Evaluate KITTI MOT baselines and generate reports")
++    parser.add_argument("--config", default="configs/pipeline.yaml", type=Path)
++    parser.add_argument("--sequence", default="0000")
++    parser.add_argument("--start-frame", type=int, default=None)
++    parser.add_argument("--end-frame", type=int, default=None)
++    args = parser.parse_args(argv)
++    config_path = args.config if args.config.is_absolute() else REPO_ROOT / args.config
++    results = run_benchmark(config_path, args.sequence, args.start_frame, args.end_frame)
++    print("Method       MOTA      IDF1      IDS   FP   FN   FPS")
++    for name, result in results.items():
++        metrics = result["metrics"]
++        print(f"{name:<12} {metrics['MOTA']:.4f}  {metrics['IDF1']:.4f}  {metrics['IDS']:>5} {metrics['FP']:>4} {metrics['FN']:>4} {metrics['FPS']:.2f}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/render_fusion_video.py b/scripts/render_fusion_video.py
+new file mode 100644
+index 0000000..f539cdd
+--- /dev/null
++++ b/scripts/render_fusion_video.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++"""Render a KITTI sequence's final fusion visualization to an MP4 video."""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++import sys
++from time import perf_counter
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
++SCRIPT_DIR = REPOSITORY_ROOT / "scripts"
++SRC_DIR = REPOSITORY_ROOT / "src"
++for path in (SCRIPT_DIR, SRC_DIR):
++    if str(path) not in sys.path:
++        sys.path.insert(0, str(path))
++
++from robot_perception.dataset import KittiTrackingDataset
++from robot_perception.dataset.calibration import parse_kitti_calibration
++from run_fusion_demo import _calibration_path, _load_yaml, render_fusion_modes
++
++
++def _resolve_path(path_value: str | Path) -> Path:
++    path = Path(path_value)
++    return path if path.is_absolute() else REPOSITORY_ROOT / path
++
++
++def _frame_is_selected(frame_id: int, start_frame: int, end_frame: int) -> bool:
++    return frame_id >= start_frame and (end_frame < 0 or frame_id <= end_frame)
++
++
++def _pad_to_even_dimensions(image):
++    """Pad odd image dimensions so MP4 codecs do not silently crop a row/column."""
++
++    import cv2
++
++    height, width = image.shape[:2]
++    return cv2.copyMakeBorder(image, 0, height % 2, 0, width % 2, cv2.BORDER_CONSTANT, value=(0, 0, 0))
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dataset-config", type=Path, default=REPOSITORY_ROOT / "configs" / "dataset.yaml")
++    parser.add_argument("--fusion-config", type=Path, default=REPOSITORY_ROOT / "configs" / "fusion.yaml")
++    parser.add_argument("--pipeline-config", type=Path, default=REPOSITORY_ROOT / "configs" / "pipeline.yaml")
++    parser.add_argument("--root", type=Path, help="KITTI root; overrides dataset.root")
++    parser.add_argument("--split", choices=("training", "testing"), help="KITTI split; overrides config")
++    parser.add_argument("--sequence", required=True, help="KITTI sequence ID, for example 0000")
++    parser.add_argument("--start-frame", type=int, default=0)
++    parser.add_argument("--end-frame", type=int, default=-1, help="inclusive end frame; -1 selects the full sequence")
++    parser.add_argument("--lidar-points-mode", choices=("raw", "non_ground", "none"))
++    parser.add_argument("--fps", type=float, help="output video FPS; overrides visualization.video_fps")
++    parser.add_argument("--output", type=Path, help="MP4 output path")
++    args = parser.parse_args()
++
++    writer = None
++    try:
++        dataset_settings = _load_yaml(args.dataset_config).get("dataset")
++        fusion_config = _load_yaml(args.fusion_config)
++        fusion_settings = fusion_config.get("fusion")
++        visualization_settings = fusion_config.get("visualization", {})
++        pipeline_settings = _load_yaml(args.pipeline_config)
++        pointcloud_settings = pipeline_settings.get("pointcloud")
++        ground_settings = pipeline_settings.get("ground")
++        if not isinstance(dataset_settings, dict) or not isinstance(fusion_settings, dict):
++            raise ValueError("dataset and fusion mappings are required")
++        if not isinstance(visualization_settings, dict):
++            raise ValueError("visualization mapping is required when provided")
++        if not isinstance(pointcloud_settings, dict) or not isinstance(ground_settings, dict):
++            raise ValueError("pipeline config requires pointcloud and ground mappings")
++        root_value = args.root or dataset_settings.get("root")
++        if root_value is None:
++            raise ValueError("provide --root or set dataset.root")
++        root = _resolve_path(root_value)
++        split = args.split or str(dataset_settings.get("split", "training"))
++        dataset = KittiTrackingDataset(root, split=split, sequences=[args.sequence], load_images=True, load_annotations=True)
++        calibration = parse_kitti_calibration(_calibration_path(root, split, dataset.sequence_ids[0]))
++        mode = args.lidar_points_mode or str(visualization_settings.get("video_lidar_points_mode", "non_ground"))
++        if mode not in {"raw", "non_ground", "none"}:
++            raise ValueError("video_lidar_points_mode must be raw, non_ground, or none")
++        fps = float(args.fps if args.fps is not None else visualization_settings.get("video_fps", 10.0))
++        if fps <= 0.0:
++            raise ValueError("fps must be positive")
++        output = args.output or REPOSITORY_ROOT / "outputs" / "videos" / f"fusion_{dataset.sequence_ids[0]}_{mode}.mp4"
++        if not output.is_absolute():
++            output = REPOSITORY_ROOT / output
++        output.parent.mkdir(parents=True, exist_ok=True)
++
++        import cv2
++
++        frame_count = 0
++        total_fused = 0
++        start = perf_counter()
++        # Dataset 的 LiDAR 帧索引不需要解码图像/点云；先筛选可避免只导出
++        # 末段视频时仍读取完整 sequence。
++        frame_keys = getattr(dataset, "_frame_keys", ())
++        indexed_frame_ids = [key.frame_id for key in frame_keys]
++        if len(indexed_frame_ids) != len(dataset):
++            indexed_frame_ids = [dataset[index].frame_id for index in range(len(dataset))]
++        for index, frame_id in enumerate(indexed_frame_ids):
++            if not _frame_is_selected(frame_id, args.start_frame, args.end_frame):
++                continue
++            frame = dataset[index]
++            rendered, counts, fusion_result = render_fusion_modes(
++                frame,
++                calibration,
++                fusion_settings=fusion_settings,
++                pointcloud_settings=pointcloud_settings,
++                ground_settings=ground_settings,
++                visualization_settings=visualization_settings,
++                modes=(mode,),
++            )
++            image = rendered[mode]
++            cv2.putText(
++                image,
++                f"Sequence {frame.sequence_id} | Frame {frame.frame_id:06d} | projected points {counts[mode]}",
++                (12, image.shape[0] - 14),
++                cv2.FONT_HERSHEY_SIMPLEX,
++                0.45,
++                (255, 255, 255),
++                2,
++                cv2.LINE_AA,
++            )
++            image = _pad_to_even_dimensions(image)
++            if writer is None:
++                height, width = image.shape[:2]
++                writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
++                if not writer.isOpened():
++                    raise OSError(f"failed to open MP4 VideoWriter: {output}")
++            writer.write(image)
++            frame_count += 1
++            total_fused += len(fusion_result.fused_detections)
++            if frame_count % 10 == 0 or frame_count == 1:
++                print(f"Rendered {frame_count} frames; latest KITTI frame={frame.frame_id:06d}")
++        if not frame_count:
++            raise ValueError("no KITTI frames selected by start_frame/end_frame")
++        elapsed = perf_counter() - start
++    except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++    finally:
++        if writer is not None:
++            writer.release()
++
++    print(f"Saved fusion video: {output}")
++    print(f"Frames written: {frame_count}")
++    print(f"Mode: {mode}")
++    print(f"Average fused objects/frame: {total_fused / frame_count:.2f}")
++    print(f"Processing time: {elapsed:.2f} s ({frame_count / elapsed:.2f} FPS)")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/run_fusion_demo.py b/scripts/run_fusion_demo.py
+index d306191..53290cb 100644
+--- a/scripts/run_fusion_demo.py
++++ b/scripts/run_fusion_demo.py
+@@ -12,7 +12,7 @@ import numpy as np
+ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+ 
+-from robot_perception.common.geometry import lidar_to_image
++from robot_perception.common.geometry import lidar_to_camera, lidar_to_image
+ from robot_perception.common.types import Detection3D
+ from robot_perception.dataset import KittiTrackingDataset
+ from robot_perception.dataset.calibration import parse_kitti_calibration
+@@ -20,8 +20,11 @@ from robot_perception.detection import GTDetector
+ from robot_perception.fusion import (
+     SyntheticCameraDetector,
+     associate_camera_lidar_detections,
+-    project_detection_corners_to_image,
+ )
++from robot_perception.pointcloud import preprocess_point_cloud
++
++
++LIDAR_POINTS_MODES = frozenset({"raw", "non_ground", "none"})
+ 
+ 
+ def _load_yaml(path: Path) -> dict[str, object]:
+@@ -54,10 +57,251 @@ def _draw_box(image: np.ndarray, bbox: np.ndarray, color: tuple[int, int, int],
+     cv2.putText(image, label, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+ 
+ 
++def _select_lidar_points(
++    mode: str,
++    raw_points: np.ndarray,
++    non_ground_points: np.ndarray,
++) -> np.ndarray:
++    """Return the configured visualization point cloud without mutating inputs."""
++
++    if mode not in LIDAR_POINTS_MODES:
++        raise ValueError(f"lidar_points_mode must be one of {sorted(LIDAR_POINTS_MODES)}, got {mode!r}")
++    if mode == "raw":
++        return raw_points
++    if mode == "non_ground":
++        return non_ground_points
++    return np.empty((0, raw_points.shape[1]), dtype=raw_points.dtype)
++
++
++def _project_points_with_depth(
++    points: np.ndarray,
++    calibration: object,
++    image_shape: tuple[int, ...],
++) -> tuple[np.ndarray, np.ndarray]:
++    """Project points and return rectified camera depths aligned with pixels."""
++
++    pixels, projection_mask = lidar_to_image(
++        points,
++        calibration,
++        image_shape=image_shape,
++        return_mask=True,
++    )
++    if not len(pixels):
++        return pixels, np.empty(0, dtype=np.float64)
++    # lidar_to_image 的 mask 始终对应输入 points 的行；以同一 mask 取 rectified
++    # camera z，保证每个 pixel 的颜色来自其自身的有效投影深度。
++    camera_points, finite_mask = lidar_to_camera(points, calibration, return_mask=True)
++    rectification = np.asarray(getattr(calibration, "R0_rect"), dtype=np.float64)
++    rectified_depths = (camera_points @ rectification.T)[:, 2]
++    depths_by_input = np.full(len(points), np.nan, dtype=np.float64)
++    depths_by_input[finite_mask] = rectified_depths
++    return pixels, depths_by_input[projection_mask]
++
++
++def _depth_colours(depths: np.ndarray, lower_percentile: float, upper_percentile: float) -> np.ndarray:
++    """Map rectified camera depth to OpenCV BGR colours using TURBO."""
++
++    try:
++        import cv2
++    except ImportError as error:
++        raise RuntimeError("OpenCV is required for fusion visualization") from error
++    values = np.asarray(depths, dtype=np.float64)
++    if values.ndim != 1 or not np.isfinite(values).all():
++        raise ValueError("projection depths must be a finite one-dimensional array")
++    if not 0.0 <= lower_percentile < upper_percentile <= 100.0:
++        raise ValueError("depth_percentiles must satisfy 0 <= low < high <= 100")
++    if not len(values):
++        return np.empty((0, 3), dtype=np.uint8)
++    low, high = np.percentile(values, (lower_percentile, upper_percentile))
++    if high <= low:
++        normalized = np.full(len(values), 0.5, dtype=np.float64)
++    else:
++        normalized = np.clip((values - low) / (high - low), 0.0, 1.0)
++    return cv2.applyColorMap(np.rint(normalized * 255.0).astype(np.uint8), cv2.COLORMAP_TURBO).reshape(-1, 3)
++
++
++def _draw_depth_projection(
++    image: np.ndarray,
++    pixels: np.ndarray,
++    depths: np.ndarray,
++    *,
++    max_points: int,
++    point_radius: int,
++    depth_percentiles: tuple[float, float],
++) -> np.ndarray:
++    """Draw a bounded subsample of projected points, coloured by camera depth."""
++
++    try:
++        import cv2
++    except ImportError as error:
++        raise RuntimeError("OpenCV is required for fusion visualization") from error
++    if max_points < 1 or point_radius < 1:
++        raise ValueError("max_projected_points and point_radius must be positive")
++    if pixels.shape != (len(depths), 2):
++        raise ValueError("pixels must have shape (N, 2) aligned with depths")
++    output = image.copy()
++    if not len(pixels):
++        return output
++    indices = np.linspace(0, len(pixels) - 1, min(len(pixels), max_points), dtype=np.int64)
++    selected_pixels = pixels[indices]
++    selected_colours = _depth_colours(depths[indices], *depth_percentiles)
++    # geometry 已向量化处理投影；OpenCV circle API 需要逐点执行实际绘制。
++    for (u, v), colour in zip(np.rint(selected_pixels).astype(np.int32), selected_colours):
++        cv2.circle(output, (int(u), int(v)), point_radius, tuple(int(value) for value in colour), -1)
++    return output
++
++
++def _render_fusion_image(
++    image: np.ndarray,
++    pixels: np.ndarray,
++    depths: np.ndarray,
++    fusion_result: object,
++    *,
++    mode: str,
++    visualization_settings: dict[str, object],
++) -> np.ndarray:
++    """Render one point-cloud mode plus the unchanged object-level fusion overlays."""
++
++    depth_values = visualization_settings.get("depth_percentiles", (2.0, 98.0))
++    if not isinstance(depth_values, (list, tuple)) or len(depth_values) != 2:
++        raise ValueError("visualization.depth_percentiles must contain exactly two values")
++    output = _draw_depth_projection(
++        image,
++        pixels,
++        depths,
++        max_points=int(visualization_settings.get("max_projected_points", 20000)),
++        point_radius=int(visualization_settings.get("point_radius", 1)),
++        depth_percentiles=(float(depth_values[0]), float(depth_values[1])),
++    )
++    import cv2
++
++    cv2.putText(
++        output,
++        f"LiDAR points: {mode} (depth colour)",
++        (12, 24),
++        cv2.FONT_HERSHEY_SIMPLEX,
++        0.55,
++        (255, 255, 255),
++        2,
++        cv2.LINE_AA,
++    )
++    for fused in fusion_result.fused_detections:
++        _draw_box(output, fused.projected_bbox, (0, 255, 0), f"3D/ID {fused.track_id}")
++        _draw_box(output, fused.camera_detection.bbox, (255, 0, 0), f"2D/ID {fused.track_id}")
++    return output
++
++
++def _output_paths(output: Path | None, sequence_id: str, frame_id: int, mode: str) -> dict[str, Path]:
++    """Keep the configured main output and always create raw/non-ground comparisons."""
++
++    output_dir = REPOSITORY_ROOT / "outputs" / "visualizations" if output is None else output.parent
++    stem = f"fusion_{sequence_id}_{frame_id:06d}"
++    primary = output or output_dir / f"{stem}_{mode}.png"
++    return {
++        "primary": primary,
++        "raw": output_dir / f"{stem}_raw.png",
++        "non_ground": output_dir / f"{stem}_non_ground.png",
++    }
++
++
++def _associate_frame_detections(
++    frame: object,
++    calibration: object,
++    fusion_settings: dict[str, object],
++) -> object:
++    """Run the existing experimental object-level fusion path for one frame."""
++
++    # GTDetector 这里只作为实验用 LiDAR 侧输入；KITTI 相机标注位置是 bottom-center。
++    gt_detections = GTDetector(class_ids={1, 2, 3}).predict(frame)
++    lidar_detections: list[Detection3D] = []
++    for detection in gt_detections:
++        centered_position = detection.position.copy()
++        centered_position[1] -= detection.dimensions[2] / 2.0
++        lidar_detections.append(
++            Detection3D(centered_position, detection.dimensions, detection.yaw, detection.score, detection.class_id)
++        )
++    camera_detections = SyntheticCameraDetector(
++        score_threshold=float(fusion_settings.get("camera_score_threshold", 0.0)),
++        class_ids={1, 2, 3},
++        bbox_noise_std=float(fusion_settings.get("camera_bbox_noise_std", 0.0)),
++        random_seed=fusion_settings.get("random_seed"),
++    ).predict(frame)
++    return associate_camera_lidar_detections(
++        lidar_detections,
++        camera_detections,
++        calibration,
++        image_shape=frame.image.shape,
++        iou_threshold=float(fusion_settings["iou_threshold"]),
++        center_distance_threshold=float(fusion_settings["center_distance_threshold"]),
++        coordinate_frame="camera",
++    )
++
++
++def render_fusion_modes(
++    frame: object,
++    calibration: object,
++    *,
++    fusion_settings: dict[str, object],
++    pointcloud_settings: dict[str, object],
++    ground_settings: dict[str, object],
++    visualization_settings: dict[str, object],
++    modes: tuple[str, ...],
++) -> tuple[dict[str, np.ndarray], dict[str, int], object]:
++    """Render requested point-cloud modes while reusing one fusion calculation.
++
++    ``raw`` uses ``frame.lidar_points`` directly. ``non_ground`` is the final
++    output of the configured preprocessing pipeline. ``none`` renders only
++    object-level fusion overlays. Calibration and fusion geometry are called
++    unchanged; this function merely selects the visualization input.
++    """
++
++    if frame.image is None:
++        raise ValueError("fusion visualization requires a camera image")
++    requested_modes = tuple(dict.fromkeys(modes))
++    invalid_modes = sorted(set(requested_modes) - LIDAR_POINTS_MODES)
++    if invalid_modes:
++        raise ValueError(f"lidar_points_mode must be one of {sorted(LIDAR_POINTS_MODES)}, got {invalid_modes}")
++    fusion_result = _associate_frame_detections(frame, calibration, fusion_settings)
++    raw_points = frame.lidar_points
++    if "non_ground" in requested_modes:
++        preprocess_result = preprocess_point_cloud(
++            raw_points,
++            pointcloud_config=pointcloud_settings,
++            ground_config=ground_settings,
++        )
++        non_ground_points = preprocess_result.non_ground_points
++    else:
++        non_ground_points = np.empty((0, raw_points.shape[1]), dtype=raw_points.dtype)
++    points_by_mode = {
++        mode: _select_lidar_points(mode, raw_points, non_ground_points)
++        for mode in requested_modes
++    }
++    projections = {
++        mode: _project_points_with_depth(points, calibration, frame.image.shape)
++        for mode, points in points_by_mode.items()
++    }
++    rendered: dict[str, np.ndarray] = {}
++    counts: dict[str, int] = {}
++    for mode, (pixels, depths) in projections.items():
++        rendered[mode] = _render_fusion_image(
++            frame.image,
++            pixels,
++            depths,
++            fusion_result,
++            mode=mode,
++            visualization_settings=visualization_settings,
++        )
++        counts[mode] = len(pixels)
++    counts["raw_input"] = len(raw_points)
++    counts["non_ground_input"] = len(non_ground_points)
++    return rendered, counts, fusion_result
++
++
+ def main() -> int:
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--dataset-config", type=Path, default=REPOSITORY_ROOT / "configs" / "dataset.yaml")
+     parser.add_argument("--fusion-config", type=Path, default=REPOSITORY_ROOT / "configs" / "fusion.yaml")
++    parser.add_argument("--pipeline-config", type=Path, default=REPOSITORY_ROOT / "configs" / "pipeline.yaml")
+     parser.add_argument("--root", type=Path, help="KITTI root; overrides dataset.root")
+     parser.add_argument("--split", choices=("training", "testing"), help="KITTI split; overrides config")
+     parser.add_argument("--sequence", required=True, help="KITTI sequence ID")
+@@ -67,9 +311,18 @@ def main() -> int:
+ 
+     try:
+         dataset_settings = _load_yaml(args.dataset_config).get("dataset")
+-        fusion_settings = _load_yaml(args.fusion_config).get("fusion")
++        fusion_config = _load_yaml(args.fusion_config)
++        fusion_settings = fusion_config.get("fusion")
++        visualization_settings = fusion_config.get("visualization", {})
++        pipeline_settings = _load_yaml(args.pipeline_config)
++        pointcloud_settings = pipeline_settings.get("pointcloud")
++        ground_settings = pipeline_settings.get("ground")
+         if not isinstance(dataset_settings, dict) or not isinstance(fusion_settings, dict):
+             raise ValueError("dataset and fusion mappings are required")
++        if not isinstance(visualization_settings, dict):
++            raise ValueError("visualization mapping is required when provided")
++        if not isinstance(pointcloud_settings, dict) or not isinstance(ground_settings, dict):
++            raise ValueError("pipeline config requires pointcloud and ground mappings")
+         root_value = args.root or dataset_settings.get("root")
+         if root_value is None:
+             raise ValueError("provide --root or set dataset.root")
+@@ -83,50 +336,35 @@ def main() -> int:
+             raise ValueError("fusion visualization requires a camera image")
+         calibration = parse_kitti_calibration(_calibration_path(root, split, frame.sequence_id))
+ 
+-        # GTDetector 这里只作为实验用 LiDAR 侧输入；KITTI 相机标注位置是 bottom-center。
+-        gt_detections = GTDetector(class_ids={1, 2, 3}).predict(frame)
+-        lidar_detections: list[Detection3D] = []
+-        for detection in gt_detections:
+-            centered_position = detection.position.copy()
+-            centered_position[1] -= detection.dimensions[2] / 2.0
+-            lidar_detections.append(
+-                Detection3D(centered_position, detection.dimensions, detection.yaw, detection.score, detection.class_id)
+-            )
+-        camera_detections = SyntheticCameraDetector(
+-            score_threshold=float(fusion_settings.get("camera_score_threshold", 0.0)),
+-            class_ids={1, 2, 3},
+-            bbox_noise_std=float(fusion_settings.get("camera_bbox_noise_std", 0.0)),
+-            random_seed=fusion_settings.get("random_seed"),
+-        ).predict(frame)
+-        fusion_result = associate_camera_lidar_detections(
+-            lidar_detections,
+-            camera_detections,
++        mode = str(visualization_settings.get("lidar_points_mode", "raw"))
++        if mode not in LIDAR_POINTS_MODES:
++            raise ValueError(f"lidar_points_mode must be one of {sorted(LIDAR_POINTS_MODES)}, got {mode!r}")
++        rendered, counts, fusion_result = render_fusion_modes(
++            frame,
+             calibration,
+-            image_shape=frame.image.shape,
+-            iou_threshold=float(fusion_settings["iou_threshold"]),
+-            center_distance_threshold=float(fusion_settings["center_distance_threshold"]),
+-            coordinate_frame="camera",
++            fusion_settings=fusion_settings,
++            pointcloud_settings=pointcloud_settings,
++            ground_settings=ground_settings,
++            visualization_settings=visualization_settings,
++            modes=("raw", "non_ground", mode),
+         )
+-        # 点云投影只展示几何结果，与后面的跨模态匹配是两个独立阶段。
+-        pixels, _ = lidar_to_image(frame.lidar_points, calibration, image_shape=frame.image.shape, return_mask=True)
+-        image = frame.image.copy()
++        paths = _output_paths(args.output, frame.sequence_id, frame.frame_id, mode)
+         import cv2
+ 
+-        for u, v in pixels[:: max(1, len(pixels) // 20000)].astype(np.int32):
+-            cv2.circle(image, (int(u), int(v)), 1, (0, 255, 0), -1)
+-        for fused in fusion_result.fused_detections:
+-            _draw_box(image, fused.projected_bbox, (0, 255, 0), f"3D/ID {fused.track_id}")
+-            _draw_box(image, fused.camera_detection.bbox, (255, 0, 0), f"2D/ID {fused.track_id}")
+-        output = args.output or REPOSITORY_ROOT / "outputs" / "visualizations" / f"fusion_{frame.sequence_id}_{frame.frame_id:06d}.png"
+-        output.parent.mkdir(parents=True, exist_ok=True)
+-        if not cv2.imwrite(str(output), image):
+-            raise OSError(f"failed to write visualization: {output}")
++        for name, output in paths.items():
++            source_mode = mode if name == "primary" else name
++            output.parent.mkdir(parents=True, exist_ok=True)
++            if not cv2.imwrite(str(output), rendered[source_mode]):
++                raise OSError(f"failed to write visualization: {output}")
+     except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError) as error:
+         print(f"Error: {error}", file=sys.stderr)
+         return 2
+ 
+-    print(f"Saved fusion visualization: {output}")
+-    print(f"Projected LiDAR points: {len(pixels)}")
++    print(f"Saved fusion visualization ({mode}): {paths['primary']}")
++    print(f"Saved raw projection: {paths['raw']}")
++    print(f"Saved non-ground projection: {paths['non_ground']}")
++    print(f"Projected raw LiDAR points: {counts['raw']}")
++    print(f"Projected non-ground LiDAR points: {counts['non_ground']}")
+     print(f"Fused objects: {len(fusion_result.fused_detections)}")
+     print(f"Unmatched LiDAR: {fusion_result.unmatched_lidar.tolist()}")
+     print(f"Unmatched camera: {fusion_result.unmatched_camera.tolist()}")
+diff --git a/tests/test_evaluate.py b/tests/test_evaluate.py
+new file mode 100644
+index 0000000..4610a3d
+--- /dev/null
++++ b/tests/test_evaluate.py
+@@ -0,0 +1,61 @@
++"""Focused tests for benchmark metric generation and baseline edge cases."""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++import sys
++
++import numpy as np
++
++from robot_perception.common.types import Detection3D
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SPEC = importlib.util.spec_from_file_location("evaluate_script", ROOT / "scripts" / "evaluate.py")
++assert SPEC is not None and SPEC.loader is not None
++evaluate = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = evaluate
++SPEC.loader.exec_module(evaluate)
++
++
++def _truth(track_id: int, position: tuple[float, float, float]) -> object:
++    return evaluate.TruthObject(track_id, 1, np.asarray(position, dtype=np.float64))
++
++
++def _observation(track_id: int, position: tuple[float, float, float]) -> object:
++    return evaluate.TrackObservation(track_id, 1, np.asarray(position, dtype=np.float64))
++
++
++def test_compute_metrics_perfect_sequence() -> None:
++    truths = [[_truth(7, (0.0, 0.0, 0.0))], [_truth(7, (1.0, 0.0, 0.0))]]
++    predictions = [[_observation(1, (0.0, 0.0, 0.0))], [_observation(1, (1.0, 0.0, 0.0))]]
++
++    metrics = evaluate.compute_metrics(truths, predictions, distance_threshold=0.5)
++
++    assert metrics["MOTA"] == 1.0
++    assert metrics["IDF1"] == 1.0
++    assert metrics["IDS"] == 0
++    assert metrics["FP"] == 0
++    assert metrics["FN"] == 0
++
++
++def test_compute_metrics_counts_switch_fp_fn() -> None:
++    truths = [[_truth(7, (0.0, 0.0, 0.0))], [_truth(7, (1.0, 0.0, 0.0))]]
++    predictions = [
++        [_observation(1, (0.0, 0.0, 0.0)), _observation(99, (20.0, 0.0, 0.0))],
++        [_observation(2, (1.0, 0.0, 0.0))],
++    ]
++
++    metrics = evaluate.compute_metrics(truths, predictions, distance_threshold=0.5)
++
++    assert metrics["IDS"] == 1
++    assert metrics["FP"] == 1
++    assert metrics["FN"] == 0
++
++
++def test_nearest_neighbor_empty_input_is_safe() -> None:
++    tracker = evaluate.NearestNeighborBaseline(max_age=2, association_distance=1.0)
++    assert tracker.update([]) == []
++    detection = Detection3D(np.zeros(3), np.ones(3), 0.0, 1.0, 1)
++    assert len(tracker.update([detection])) == 1
+diff --git a/tests/test_fusion.py b/tests/test_fusion.py
+index 28d55d2..8a7cb20 100644
+--- a/tests/test_fusion.py
++++ b/tests/test_fusion.py
+@@ -4,6 +4,9 @@ from __future__ import annotations
+ 
+ import numpy as np
+ import pytest
++import importlib.util
++import sys
++from pathlib import Path
+ 
+ from robot_perception.common.types import Detection3D, FrameData, KittiTrackingAnnotation
+ from robot_perception.dataset.calibration import KittiCalibration
+@@ -16,6 +19,14 @@ from robot_perception.fusion import (
+ )
+ 
+ 
++ROOT = Path(__file__).resolve().parents[1]
++SCRIPT_SPEC = importlib.util.spec_from_file_location("fusion_visualization", ROOT / "scripts" / "run_fusion_demo.py")
++assert SCRIPT_SPEC is not None and SCRIPT_SPEC.loader is not None
++fusion_visualization = importlib.util.module_from_spec(SCRIPT_SPEC)
++sys.modules[SCRIPT_SPEC.name] = fusion_visualization
++SCRIPT_SPEC.loader.exec_module(fusion_visualization)
++
++
+ def _calibration() -> KittiCalibration:
+     return KittiCalibration(
+         P2=np.asarray(((10.0, 0.0, 50.0, 0.0), (0.0, 10.0, 50.0, 0.0), (0.0, 0.0, 1.0, 0.0))),
+@@ -133,3 +144,37 @@ def test_synthetic_camera_detector_is_experimental_and_preserves_track_id() -> N
+ def test_camera_detection_rejects_invalid_bbox() -> None:
+     with pytest.raises(ValueError, match="bbox"):
+         Camera2DDetection(np.asarray((10.0, 20.0, 5.0, 40.0)), 0.8, 1)
++
++
++def test_visualization_selects_raw_non_ground_or_none() -> None:
++    raw = np.asarray(((1.0, 0.0, 0.0, 0.1), (2.0, 0.0, 0.0, 0.2)))
++    non_ground = raw[1:]
++
++    np.testing.assert_array_equal(fusion_visualization._select_lidar_points("raw", raw, non_ground), raw)
++    np.testing.assert_array_equal(
++        fusion_visualization._select_lidar_points("non_ground", raw, non_ground), non_ground
++    )
++    assert fusion_visualization._select_lidar_points("none", raw, non_ground).shape == (0, 4)
++    with pytest.raises(ValueError, match="lidar_points_mode"):
++        fusion_visualization._select_lidar_points("ground", raw, non_ground)
++
++
++def test_visualization_depth_colours_vary_with_depth() -> None:
++    colours = fusion_visualization._depth_colours(np.asarray((2.0, 10.0, 20.0)), 0.0, 100.0)
++
++    assert colours.shape == (3, 3)
++    assert colours.dtype == np.uint8
++    assert not np.array_equal(colours[0], colours[-1])
++
++
++def test_visualization_projection_depths_align_with_pixels() -> None:
++    points = np.asarray(((0.0, 0.0, 10.0, 0.1), (0.0, 0.0, -1.0, 0.2)))
++
++    pixels, depths = fusion_visualization._project_points_with_depth(points, _calibration(), (100, 100, 3))
++
++    np.testing.assert_allclose(pixels, ((50.0, 50.0),))
++    np.testing.assert_allclose(depths, (10.0,))
++
++
++def test_render_modes_deduplicates_requested_mode_names() -> None:
++    assert tuple(dict.fromkeys(("raw", "non_ground", "raw"))) == ("raw", "non_ground")
+diff --git a/tests/test_fusion_video.py b/tests/test_fusion_video.py
+new file mode 100644
+index 0000000..72bd255
+--- /dev/null
++++ b/tests/test_fusion_video.py
+@@ -0,0 +1,34 @@
++"""Tests for the offline fusion video script's frame-range contract."""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++import sys
++
++import numpy as np
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SPEC = importlib.util.spec_from_file_location("fusion_video", ROOT / "scripts" / "render_fusion_video.py")
++assert SPEC is not None and SPEC.loader is not None
++fusion_video = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = fusion_video
++SPEC.loader.exec_module(fusion_video)
++
++
++def test_frame_selection_has_inclusive_end_and_negative_all_frames() -> None:
++    assert fusion_video._frame_is_selected(0, 0, 153)
++    assert fusion_video._frame_is_selected(153, 0, 153)
++    assert not fusion_video._frame_is_selected(154, 0, 153)
++    assert fusion_video._frame_is_selected(153, 0, -1)
++    assert not fusion_video._frame_is_selected(3, 4, -1)
++
++
++def test_video_padding_preserves_content_and_makes_dimensions_even() -> None:
++    image = np.full((375, 1241, 3), 7, dtype=np.uint8)
++
++    padded = fusion_video._pad_to_even_dimensions(image)
++
++    assert padded.shape == (376, 1242, 3)
++    np.testing.assert_array_equal(padded[:375, :1241], image)

@@ -4,19 +4,19 @@
 
 ## Configuration
 
-- Git commit: `8c9be185d82818439b64cafea6f65dd727560b18`
+- Git commit: `38c0a143f638422118a17a76063e16dfb085a9da`
 - Dataset sequence: `0000`
 - Frame range: `0..153`
-- Timestamp (UTC): `2026-09-03T05:53:20.860119+00:00`
+- Timestamp (UTC): `2026-09-03T07:16:51.987255+00:00`
 - Config: `{"pipeline": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/pipeline.yaml", "dataset": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/dataset.yaml", "detector": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/detector.yaml", "tracker": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/tracker.yaml"}`
 
 ## Metrics
 
 | Method | MOTA | IDF1 | IDS | FP | FN | FPS | latency/frame (ms) | CPU peak RSS (MB) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| baseline_nn | 1.0000 | 1.0000 | 0 | 0 | 0 | 6766.61 | 0.148 | 68.17 |
-| baseline_kf | 1.0000 | 1.0000 | 0 | 0 | 0 | 1364.61 | 0.733 | 68.17 |
-| proposed | 1.0000 | 1.0000 | 0 | 0 | 0 | 912.12 | 1.096 | 68.17 |
+| baseline_nn | 1.0000 | 1.0000 | 0 | 0 | 0 | 6701.92 | 0.149 | 62.94 |
+| baseline_kf | 1.0000 | 1.0000 | 0 | 0 | 0 | 1094.63 | 0.914 | 62.94 |
+| proposed | 1.0000 | 1.0000 | 0 | 0 | 0 | 1034.87 | 0.966 | 62.94 |
 
 ## Runtime
 
