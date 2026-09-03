@@ -135,7 +135,7 @@ def test_mmdet3d_pointpillars_adapter_converts_model_output() -> None:
 
     assert len(detections) == 1
     np.testing.assert_allclose(detections[0].position, (1.0, 2.0, 3.0))
-    np.testing.assert_allclose(detections[0].dimensions, (4.0, 1.5, 1.7))
+    np.testing.assert_allclose(detections[0].dimensions, (1.5, 4.0, 1.7))
     assert detections[0].class_id == 2
     assert detections[0].score == pytest.approx(0.9)
 

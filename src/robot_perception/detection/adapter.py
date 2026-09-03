@@ -283,8 +283,8 @@ class MMDet3DPointPillarsAdapter(BaseDetector):
             class_id = self.class_mapping.get(int(label))
             if class_id is None or float(score) < self.score_threshold:
                 continue
-            # MMDetection3D LiDAR box 默认顺序为 x,y,z,w,l,h,yaw；项目统一为 l,w,h。
-            dimensions = box[[4, 3, 5]].astype(np.float64, copy=True)
+            # MMDetection3D v1.0rc6 的 LiDAR box 已统一为 x,y,z,l,w,h,yaw。
+            dimensions = box[3:6].astype(np.float64, copy=True)
             if not np.isfinite(dimensions).all() or (dimensions <= 0.0).any():
                 continue
             detections.append(

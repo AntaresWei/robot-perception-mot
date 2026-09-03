@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeAlias
+try:
+    from typing import TypeAlias
+except ImportError:  # Python 3.8 compatibility for the legacy MMDetection3D environment.
+    from typing_extensions import TypeAlias
 
 import numpy as np
 
