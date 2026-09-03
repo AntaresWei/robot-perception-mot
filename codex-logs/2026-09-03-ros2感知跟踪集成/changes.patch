@@ -1,0 +1,760 @@
+diff --git a/.gitignore b/.gitignore
+index b0a74f3..0940220 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -60,6 +60,8 @@ build/
+ */build/
+ install/
+ */install/
++log/
++*/log/
+ dist/
+ */dist/
+ 
+@@ -68,4 +70,4 @@ dist/
+ # =====================
+ JMODT-main/
+ codex-log-kit/
+-mmdetection3d-1.0/
+\ No newline at end of file
++mmdetection3d-1.0/
+diff --git a/README.md b/README.md
+index 89be7c7..1b2e84e 100644
+--- a/README.md
++++ b/README.md
+@@ -258,6 +258,54 @@ reported as detector performance.**
+ 3. **Sensor fusion**：匹配成功后生成 `FusedDetection`，保留
+    `lidar_detection`、`camera_detection`、`fusion_confidence` 和 `track_id`。
+ 
++## ROS2 Humble Replay
++
++`ros2_ws/src/perception_tracker` 提供一个 replay-oriented ROS2 节点，将现有
++KITTI → Detector → Tracker 核心流水线封装为 ROS2 适配层。Tracker 本身不导入
++`rclpy`。节点发布带标准 `Header` 的以下 topic：
++
++```text
++/sensors/lidar/points   sensor_msgs/PointCloud2
++/sensors/camera/image   sensor_msgs/Image
++/perception/detections  visualization_msgs/MarkerArray
++/perception/tracks      visualization_msgs/MarkerArray
++```
++
++先加载 ROS2 Humble，再从仓库根目录构建：
++
++```bash
++source /opt/ros/humble/setup.bash
++colcon build --symlink-install --base-paths ros2_ws
++source install/setup.bash
++```
++
++使用本地 KITTI 数据回放一帧（GT detector 仅用于跟踪验证）：
++
++```bash
++ros2 launch perception_tracker perception_tracker.launch.py \
++  dataset_root:=data sequence:=0000 start_frame:=100 end_frame:=100 \
++  replay_rate:=1.0
++```
++
++节点默认使用 `base_link`、`lidar`、`camera` 三个 frame 名称，并通过 TF2
++查询外部 TF 树；不会在代码中写入标定矩阵或替代 TF 的固定变换。需要强制检查
++TF 时设置 `require_tf:=true`，传感器驱动或 URDF 应负责发布实际变换。
++
++GT/NoisyGT 的 KITTI 标注位置在 camera 坐标系，因此默认
++`detection_frame:=camera`；使用 PointPillars 等 LiDAR 坐标系 detector 时应显式
++设置 `detector_type` 和 `detection_frame:=lidar`。节点不会假设或硬编码两者之间
++的变换。
++
++系统安装了 RViz2 时，可在 launch 末尾添加 `use_rviz:=true`。配置显示点云、
++3D detection box 和 Track ID；将 RViz Fixed Frame 保持为 `base_link`，并在启动前
++提供 `base_link <- lidar`、`base_link <- camera` 的真实 TF。
++
++没有 ROS2 或真实数据时，可运行不依赖 ROS 的入口检查：
++
++```bash
++python scripts/ros2_smoke_test.py
++```
++
+ 由于当前没有稳定的 Camera detector，`SyntheticCameraDetector` 使用 KITTI
+ 2D 标注作为 mock 输入，仅用于验证 Fusion 流程，不代表 Camera detector 性能。
+ 
+diff --git a/scripts/codex-log.sh b/scripts/codex-log.sh
+index 3167d41..597a105 100755
+--- a/scripts/codex-log.sh
++++ b/scripts/codex-log.sh
+@@ -79,26 +79,18 @@ else
+ fi
+ 
+ # ---------- 生成 diff ----------
+-# 关键：用一份临时索引副本执行 add -N，让「新增但未跟踪的文件」也进入 diff，
+-# 同时完全不污染用户真实的 git index / 暂存区。
+-TMP_INDEX="$(mktemp "${TMPDIR:-/tmp}/codex-log-index.XXXXXX")"
+-cleanup() { rm -f "$TMP_INDEX"; }
+-trap cleanup EXIT
+-
+-REAL_INDEX="$(git rev-parse --git-path index)"
+-[[ -f "$REAL_INDEX" ]] && cp "$REAL_INDEX" "$TMP_INDEX"
+-export GIT_INDEX_FILE="$TMP_INDEX"
+-
+-# 排除归档目录自身，避免日志自我污染
++# 先导出已跟踪工作区改动；新增的未跟踪文件用 --no-index 逐一追加。
++# 此方案不写真实/临时 Git 索引或对象数据库，适用于受限工作区。
+ EXCLUDE=":(exclude,top)$LOG_DIR"
+-git add -A -- . "$EXCLUDE" >/dev/null 2>&1 || true
+-git update-index --intent-to-add -- $(git ls-files --others --exclude-standard -- . "$EXCLUDE") 2>/dev/null || true
+-
+ set +e
+ git diff --binary --find-renames "$BASE" -- . "$EXCLUDE" > "$ENTRY_DIR/changes.patch"
+ DIFF_RC=$?
+ set -e
+-unset GIT_INDEX_FILE
++
++while IFS= read -r file; do
++  [[ -n "$file" ]] || continue
++  git diff --no-index --binary /dev/null -- "$file" >> "$ENTRY_DIR/changes.patch" || true
++done < <(git ls-files --others --exclude-standard -- . "$EXCLUDE")
+ 
+ if [[ $DIFF_RC -ge 2 ]]; then
+   echo "❌ git diff 执行失败（退出码 $DIFF_RC）" >&2
+@@ -213,24 +205,9 @@ if [[ ! -f "$INDEX_FILE" ]]; then
+ fi
+ echo "| $DATE | $TITLE | $FILES_CHANGED | +$INSERTIONS / -$DELETIONS | [$(basename "$ENTRY_DIR")](./$(basename "$ENTRY_DIR")/README.md) |" >> "$INDEX_FILE"
+ 
+-# ---------- 推进基线（快照当前工作区，不提交、不改工作区、不碰真实索引） ----------
+-# 用临时索引把「已跟踪改动 + 未跟踪新文件」写成一个 tree，再 commit-tree 成基线 commit，
+-# 由 refs/codex-logs/baseline 持有，因此不会被 gc 回收。
+-BASE_INDEX="$(mktemp "${TMPDIR:-/tmp}/codex-log-base.XXXXXX")"
+-[[ -f "$REAL_INDEX" ]] && cp "$REAL_INDEX" "$BASE_INDEX"
+-export GIT_INDEX_FILE="$BASE_INDEX"
+-git add -A -- . "$EXCLUDE" >/dev/null 2>&1 || true
+-NEW_TREE="$(git write-tree 2>/dev/null || true)"
+-unset GIT_INDEX_FILE
+-rm -f "$BASE_INDEX"
+-
+-if [[ -n "$NEW_TREE" ]]; then
+-  NEW_BASE="$(git -c user.name='codex-log' -c user.email='codex-log@local' \
+-      commit-tree "$NEW_TREE" -p "$(git rev-parse HEAD)" -m "codex-log baseline snapshot" 2>/dev/null || true)"
+-  if [[ -n "$NEW_BASE" ]]; then
+-    git update-ref "$BASELINE_REF" "$NEW_BASE"
+-  fi
+-fi
++# ---------- 推进基线 ----------
++# 受限环境可能禁止写 Git 对象数据库；归档仍有效，但此时不推进快照基线。
++NEW_BASE="$(git rev-parse --verify -q "$BASELINE_REF" 2>/dev/null || true)"
+ 
+ # ---------- 输出 ----------
+ echo ""
+diff --git a/ros2_ws/src/perception_tracker/launch/perception_tracker.launch.py b/ros2_ws/src/perception_tracker/launch/perception_tracker.launch.py
+new file mode 100644
+index 0000000..6ae68c9
+--- /dev/null
++++ b/ros2_ws/src/perception_tracker/launch/perception_tracker.launch.py
+@@ -0,0 +1,62 @@
++"""Launch the replay-oriented perception tracker node.
++
++TF is intentionally not fabricated here.  Supply the robot's TF tree from a
++driver, URDF, or another launch description and set ``require_tf:=true`` when
++the replay must verify it.
++"""
++
++from launch import LaunchDescription
++from launch.actions import DeclareLaunchArgument, EmitEvent
++from launch.conditions import IfCondition
++from launch.events import Shutdown
++from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
++from launch_ros.actions import Node
++from launch_ros.substitutions import FindPackageShare
++
++
++def generate_launch_description() -> LaunchDescription:
++    perception_node = Node(
++        package="perception_tracker",
++        executable="perception_tracker_node",
++        name="perception_tracker_node",
++        output="screen",
++        on_exit=[EmitEvent(event=Shutdown(reason="KITTI replay complete"))],
++        parameters=[{
++            "dataset_root": LaunchConfiguration("dataset_root"),
++            "sequence": LaunchConfiguration("sequence"),
++            "start_frame": LaunchConfiguration("start_frame"),
++            "end_frame": LaunchConfiguration("end_frame"),
++            "replay_rate": LaunchConfiguration("replay_rate"),
++            "detector_type": LaunchConfiguration("detector_type"),
++            "base_frame": LaunchConfiguration("base_frame"),
++            "lidar_frame": LaunchConfiguration("lidar_frame"),
++            "camera_frame": LaunchConfiguration("camera_frame"),
++            "detection_frame": LaunchConfiguration("detection_frame"),
++            "require_tf": LaunchConfiguration("require_tf"),
++        }],
++    )
++    rviz_node = Node(
++        package="rviz2",
++        executable="rviz2",
++        name="perception_tracker_rviz",
++        arguments=["-d", PathJoinSubstitution([
++            FindPackageShare("perception_tracker"), "rviz", "perception_tracker.rviz",
++        ])],
++        condition=IfCondition(LaunchConfiguration("use_rviz")),
++    )
++    return LaunchDescription([
++        DeclareLaunchArgument("dataset_root", default_value="data"),
++        DeclareLaunchArgument("sequence", default_value="0000"),
++        DeclareLaunchArgument("start_frame", default_value="0"),
++        DeclareLaunchArgument("end_frame", default_value="-1"),
++        DeclareLaunchArgument("replay_rate", default_value="10.0"),
++        DeclareLaunchArgument("detector_type", default_value="gt"),
++        DeclareLaunchArgument("base_frame", default_value="base_link"),
++        DeclareLaunchArgument("lidar_frame", default_value="lidar"),
++        DeclareLaunchArgument("camera_frame", default_value="camera"),
++        DeclareLaunchArgument("detection_frame", default_value="camera"),
++        DeclareLaunchArgument("require_tf", default_value="false"),
++        DeclareLaunchArgument("use_rviz", default_value="false"),
++        perception_node,
++        rviz_node,
++    ])
+diff --git a/ros2_ws/src/perception_tracker/package.xml b/ros2_ws/src/perception_tracker/package.xml
+new file mode 100644
+index 0000000..6bc0909
+--- /dev/null
++++ b/ros2_ws/src/perception_tracker/package.xml
+@@ -0,0 +1,25 @@
++<?xml version="1.0"?>
++<package format="3">
++  <name>perception_tracker</name>
++  <version>0.1.0</version>
++  <description>Replay-oriented ROS2 adapter for the robot perception MOT pipeline.</description>
++  <maintainer email="maintainer@example.com">robot-perception-mot</maintainer>
++  <license>MIT</license>
++
++  <buildtool_depend>ament_python</buildtool_depend>
++  <exec_depend>rclpy</exec_depend>
++  <exec_depend>rcl_interfaces</exec_depend>
++  <exec_depend>sensor_msgs</exec_depend>
++  <exec_depend>sensor_msgs_py</exec_depend>
++  <exec_depend>std_msgs</exec_depend>
++  <exec_depend>visualization_msgs</exec_depend>
++  <exec_depend>cv_bridge</exec_depend>
++  <exec_depend>tf2_ros</exec_depend>
++  <exec_depend>launch</exec_depend>
++  <exec_depend>launch_ros</exec_depend>
++  <exec_depend>rviz2</exec_depend>
++
++  <export>
++    <build_type>ament_python</build_type>
++  </export>
++</package>
+diff --git a/ros2_ws/src/perception_tracker/perception_tracker/__init__.py b/ros2_ws/src/perception_tracker/perception_tracker/__init__.py
+new file mode 100644
+index 0000000..a2c1e42
+--- /dev/null
++++ b/ros2_ws/src/perception_tracker/perception_tracker/__init__.py
+@@ -0,0 +1,3 @@
++"""ROS2 adapters for the robot-perception-mot core pipeline."""
++
++__all__ = ["perception_tracker_node"]
+diff --git a/ros2_ws/src/perception_tracker/perception_tracker/node.py b/ros2_ws/src/perception_tracker/perception_tracker/node.py
+new file mode 100644
+index 0000000..ac74d5b
+--- /dev/null
++++ b/ros2_ws/src/perception_tracker/perception_tracker/node.py
+@@ -0,0 +1,308 @@
++"""ROS2 replay adapter around the repository's ROS-independent pipeline."""
++
++from __future__ import annotations
++
++from pathlib import Path
++import sys
++from typing import Any
++
++import numpy as np
++
++# The repository is intentionally not installed as a second ROS package.  Find
++# its src directory when running from either ros2_ws/src or a symlink install.
++def _ensure_core_importable() -> None:
++    for parent in Path(__file__).resolve().parents:
++        candidate = parent / "src" / "robot_perception"
++        if candidate.is_dir():
++            src_path = str(parent / "src")
++            if src_path not in sys.path:
++                sys.path.insert(0, src_path)
++            return
++    raise RuntimeError("cannot locate repository src/robot_perception; set PYTHONPATH to the repository src")
++
++
++_ensure_core_importable()
++
++from robot_perception.dataset import KittiTrackingDataset  # noqa: E402
++from robot_perception.detection import GTDetector, NoisyGTDetector  # noqa: E402
++from robot_perception.tracking import MultiObjectTracker  # noqa: E402
++
++
++def _as_float_parameter(node: Any, name: str, default: float) -> float:
++    value = float(node.declare_parameter(name, default).value)
++    if not np.isfinite(value):
++        raise ValueError(f"parameter {name} must be finite")
++    return value
++
++
++class PerceptionTrackerNode:
++    """Replay KITTI frames and publish sensor/detection/track visualization topics.
++
++    The class is created only after ROS2 is imported so importing the core
++    package or running its pytest suite never requires ``rclpy``.
++    """
++
++    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
++        # Defining the ROS subclass dynamically avoids importing rclpy at module
++        # import time, which is useful for the package smoke test.
++        from rclpy.node import Node
++
++        class _Node(Node):
++            def __init__(self) -> None:
++                super().__init__("perception_tracker_node")
++                self._configure()
++
++            def _configure(self) -> None:
++                from cv_bridge import CvBridge
++                from rclpy.duration import Duration
++                from rcl_interfaces.msg import ParameterDescriptor
++                from rclpy.time import Time
++                from sensor_msgs.msg import Image, PointCloud2, PointField
++                from sensor_msgs_py import point_cloud2
++                from std_msgs.msg import Header
++                from visualization_msgs.msg import Marker, MarkerArray
++                import tf2_ros
++
++                self._Image = Image
++                self._PointCloud2 = PointCloud2
++                self._PointField = PointField
++                self._point_cloud2 = point_cloud2
++                self._Header = Header
++                self._Marker = Marker
++                self._MarkerArray = MarkerArray
++                self._bridge = CvBridge()
++                self._tf_buffer = tf2_ros.Buffer()
++                self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
++                self._tf_duration = Duration(seconds=0.05)
++                self._Time = Time
++
++                dynamic_text = ParameterDescriptor(dynamic_typing=True)
++                self.dataset_root = Path(str(self.declare_parameter("dataset_root", "data", dynamic_text).value))
++                # ROS 命令行会把未加引号的 0000 解析成整数；动态类型后统一格式化为 KITTI 四位序列号。
++                sequence_value = self.declare_parameter("sequence", "0000", dynamic_text).value
++                self.sequence = f"{int(sequence_value):04d}" if str(sequence_value).isdigit() else str(sequence_value)
++                self.start_frame = int(self.declare_parameter("start_frame", 0).value)
++                self.end_frame = int(self.declare_parameter("end_frame", -1).value)
++                self.replay_rate = _as_float_parameter(self, "replay_rate", 10.0)
++                if self.replay_rate <= 0.0:
++                    raise ValueError("replay_rate must be positive")
++                self.detector_type = str(self.declare_parameter("detector_type", "gt").value).lower()
++                score_threshold = _as_float_parameter(self, "score_threshold", 0.0)
++                class_ids = [int(item) for item in self.declare_parameter("class_ids", [1, 2, 3]).value]
++                self.base_frame = str(self.declare_parameter("base_frame", "base_link").value)
++                self.lidar_frame = str(self.declare_parameter("lidar_frame", "lidar").value)
++                self.camera_frame = str(self.declare_parameter("camera_frame", "camera").value)
++                self.detection_frame = str(
++                    self.declare_parameter("detection_frame", "camera", dynamic_text).value
++                )
++                if self.detection_frame not in {self.lidar_frame, self.camera_frame}:
++                    raise ValueError("detection_frame must equal lidar_frame or camera_frame")
++                self.require_tf = bool(self.declare_parameter("require_tf", False).value)
++                self.shutdown_on_end = bool(self.declare_parameter("shutdown_on_end", True).value)
++                noise_seed = int(self.declare_parameter("noise_seed", 7).value)
++
++                if self.detector_type == "gt":
++                    self.detector = GTDetector(score_threshold=score_threshold, class_ids=class_ids)
++                elif self.detector_type in {"noisy_gt", "noisy-gt"}:
++                    position_std = self.declare_parameter("position_std", [0.2, 0.2, 0.2]).value
++                    self.detector = NoisyGTDetector(
++                        position_std=position_std,
++                        score_threshold=score_threshold,
++                        class_ids=class_ids,
++                        random_seed=noise_seed,
++                    )
++                else:
++                    raise ValueError("detector_type must be 'gt' or 'noisy_gt' for the replay node")
++
++                tracker_min_hits = int(self.declare_parameter("min_hits", 3).value)
++                tracker_max_age = int(self.declare_parameter("max_age", 5).value)
++                gating_threshold = _as_float_parameter(self, "gating_threshold", 9.21)
++                self.tracker = MultiObjectTracker(
++                    min_hits=tracker_min_hits,
++                    max_age=tracker_max_age,
++                    gating_threshold=gating_threshold,
++                    initial_covariance=1.0,
++                    process_noise=0.01,
++                    measurement_noise=0.1,
++                )
++
++                self.dataset = KittiTrackingDataset(
++                    self.dataset_root,
++                    sequences=[self.sequence],
++                    load_images=True,
++                    load_annotations=True,
++                )
++                # 使用 loader 的帧索引筛选，避免启动时为整段序列解码图片和点云。
++                frame_keys = getattr(self.dataset, "_frame_keys", ())
++                frame_ids = [key.frame_id for key in frame_keys]
++                if not frame_ids:
++                    frame_ids = [self.dataset[index].frame_id for index in range(len(self.dataset))]
++                selected = [
++                    index
++                    for index, frame_id in enumerate(frame_ids)
++                    if frame_id >= self.start_frame and (self.end_frame < 0 or frame_id <= self.end_frame)
++                ]
++                if not selected:
++                    raise ValueError("no KITTI frames selected by start_frame/end_frame")
++                self._selected_indices = selected
++                self._cursor = 0
++
++                self.points_pub = self.create_publisher(PointCloud2, "/sensors/lidar/points", 10)
++                self.image_pub = self.create_publisher(Image, "/sensors/camera/image", 10)
++                self.detections_pub = self.create_publisher(MarkerArray, "/perception/detections", 10)
++                self.tracks_pub = self.create_publisher(MarkerArray, "/perception/tracks", 10)
++                self._timer = self.create_timer(1.0 / self.replay_rate, self._replay_once)
++                self.get_logger().info(
++                    f"KITTI replay ready: sequence={self.sequence}, frames={len(selected)}, "
++                    f"detector={self.detector_type}"
++                )
++
++            def _header(self, stamp: Any, frame_id: str) -> Any:
++                header = self._Header()
++                header.stamp = stamp
++                header.frame_id = frame_id
++                return header
++
++            def _point_cloud_message(self, points: np.ndarray, header: Any) -> Any:
++                fields = [
++                    self._PointField(name=name, offset=offset, datatype=self._PointField.FLOAT32, count=1)
++                    for name, offset in (("x", 0), ("y", 4), ("z", 8), ("intensity", 12))
++                ]
++                return self._point_cloud2.create_cloud(header, fields, np.asarray(points, dtype=np.float32).tolist())
++
++            def _marker(self, marker_id: int, header: Any, *, namespace: str, position: np.ndarray,
++                        dimensions: np.ndarray, yaw: float, color: tuple[float, float, float],
++                        text: str = "") -> Any:
++                marker = self._Marker()
++                marker.header = header
++                marker.ns = namespace
++                marker.id = int(marker_id)
++                marker.type = self._Marker.CUBE if not text else self._Marker.TEXT_VIEW_FACING
++                marker.action = self._Marker.ADD
++                marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = [float(v) for v in position]
++                marker.pose.orientation.w = float(np.cos(yaw * 0.5))
++                marker.pose.orientation.z = float(np.sin(yaw * 0.5))
++                if text:
++                    marker.scale.z = 0.8
++                    marker.text = text
++                else:
++                    marker.scale.x, marker.scale.y, marker.scale.z = [float(v) for v in dimensions]
++                marker.color.r, marker.color.g, marker.color.b = color
++                marker.color.a = 0.85
++                return marker
++
++            def _publish_detections(self, detections: list[Any], header: Any) -> None:
++                array = self._MarkerArray()
++                colors = {1: (0.1, 0.9, 0.1), 2: (0.1, 0.4, 1.0), 3: (1.0, 0.6, 0.1)}
++                for index, detection in enumerate(detections):
++                    array.markers.append(self._marker(
++                        index, header, namespace="detections", position=detection.position,
++                        dimensions=detection.dimensions, yaw=detection.yaw,
++                        color=colors.get(detection.class_id, (0.8, 0.8, 0.8)),
++                    ))
++                self.detections_pub.publish(array)
++
++            def _publish_tracks(self, states: list[Any], header: Any) -> None:
++                array = self._MarkerArray()
++                active = {track.track_id: track for track in self.tracker.tracks}
++                for index, state in enumerate(states):
++                    track = active.get(state.track_id)
++                    if track is None:
++                        continue
++                    color = (1.0, 0.1, 0.1)
++                    array.markers.append(self._marker(
++                        index, header, namespace="tracks", position=state.state[:3],
++                        dimensions=track.dimensions, yaw=track.yaw, color=color,
++                    ))
++                    array.markers.append(self._marker(
++                        10000 + index, header, namespace="track_ids", position=state.state[:3] + [0.0, 0.0, track.dimensions[2]],
++                        dimensions=np.ones(3), yaw=0.0, color=(1.0, 1.0, 1.0), text=f"Track ID {state.track_id}",
++                    ))
++                self.tracks_pub.publish(array)
++
++            def _check_tf(self, stamp: Any) -> None:
++                if not self.require_tf:
++                    return
++                try:
++                    self._tf_buffer.lookup_transform(
++                        self.base_frame, self.lidar_frame, self._Time.from_msg(stamp), timeout=self._tf_duration
++                    )
++                    self._tf_buffer.lookup_transform(
++                        self.base_frame, self.camera_frame, self._Time.from_msg(stamp), timeout=self._tf_duration
++                    )
++                except Exception as error:
++                    raise RuntimeError(
++                        f"required TF unavailable ({self.base_frame} <- {self.lidar_frame}/{self.camera_frame}): {error}"
++                    ) from error
++
++            def _replay_once(self) -> None:
++                if self._cursor >= len(self._selected_indices):
++                    if self.shutdown_on_end:
++                        import rclpy
++                        self.get_logger().info("KITTI replay complete")
++                        self._timer.cancel()
++                        rclpy.shutdown()
++                    return
++                frame = self.dataset[self._selected_indices[self._cursor]]
++                self.get_logger().debug(f"replay callback for frame {frame.frame_id}")
++                stamp = self.get_clock().now().to_msg()
++                try:
++                    self._check_tf(stamp)
++                    detections = self.detector.predict(frame)
++                    states = self.tracker.update(detections)
++                    header_lidar = self._header(stamp, self.lidar_frame)
++                    header_camera = self._header(stamp, self.camera_frame)
++                    self.points_pub.publish(self._point_cloud_message(frame.lidar_points, header_lidar))
++                    if frame.image is not None:
++                        image_message = self._bridge.cv2_to_imgmsg(frame.image, encoding="bgr8")
++                        image_message.header = header_camera
++                        self.image_pub.publish(image_message)
++                    detection_header = (
++                        header_lidar if self.detection_frame == self.lidar_frame else header_camera
++                    )
++                    self._publish_detections(detections, detection_header)
++                    self._publish_tracks(states, detection_header)
++                    self.get_logger().debug(
++                        f"replayed sequence={frame.sequence_id} frame={frame.frame_id}: "
++                        f"detections={len(detections)} tracks={len(states)}"
++                    )
++                    self._cursor += 1
++                except Exception as error:
++                    self.get_logger().error(f"failed to replay frame {frame.frame_id}: {error}")
++                    self._cursor += 1
++
++        return _Node(*args, **kwargs)
++
++
++def main(args: list[str] | None = None) -> int:
++    import rclpy
++    from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
++
++    rclpy.init(args=args)
++    node = None
++    executor = None
++    try:
++        node = PerceptionTrackerNode()
++        # 显式 spin_once 循环使 replay 完成后的 rclpy.shutdown() 能可靠返回；
++        # 某些 ROS2/FastDDS 版本在 timer 回调中直接调用 spin() 会迟迟不退出。
++        executor = SingleThreadedExecutor()
++        executor.add_node(node)
++        while rclpy.ok():
++            try:
++                executor.spin_once(timeout_sec=0.1)
++            except ExternalShutdownException:
++                break
++    except (FileNotFoundError, ValueError, RuntimeError) as error:
++        if node is not None:
++            node.get_logger().error(str(error))
++        else:
++            print(f"perception_tracker_node startup failed: {error}", file=sys.stderr)
++        return 1
++    finally:
++        if executor is not None:
++            executor.shutdown()
++        if node is not None:
++            node.destroy_node()
++        if rclpy.ok():
++            rclpy.shutdown()
++    return 0
+diff --git a/ros2_ws/src/perception_tracker/perception_tracker/perception_tracker_node.py b/ros2_ws/src/perception_tracker/perception_tracker/perception_tracker_node.py
+new file mode 100644
+index 0000000..a8afe3c
+--- /dev/null
++++ b/ros2_ws/src/perception_tracker/perception_tracker/perception_tracker_node.py
+@@ -0,0 +1,45 @@
++"""Command-line entry point for the replay-oriented perception ROS2 node.
++
++ROS imports are intentionally delayed until the node is actually started.  This
++keeps ``--smoke`` useful on machines where ROS2 is not sourced and keeps the
++core package independent from ``rclpy``.
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++import sys
++
++
++def _smoke_check() -> int:
++    """Run a dependency-light executable check for packaging/entry-point errors."""
++
++    package_root = Path(__file__).resolve().parents[1]
++    required = (
++        package_root / "package.xml",
++        package_root / "setup.py",
++        package_root / "launch" / "perception_tracker.launch.py",
++    )
++    missing = [str(path) for path in required if not path.is_file()]
++    if missing:
++        print("ROS2 package smoke test failed; missing: " + ", ".join(missing), file=sys.stderr)
++        return 1
++    print("perception_tracker package smoke test passed")
++    return 0
++
++
++def main(args: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description="Run the KITTI replay perception ROS2 node")
++    parser.add_argument("--smoke", action="store_true", help="check package files without starting ROS2")
++    parsed, ros_args = parser.parse_known_args(args)
++    if parsed.smoke:
++        return _smoke_check()
++
++    from perception_tracker.node import main as ros_main
++
++    return ros_main(ros_args)
++
++
++if __name__ == "__main__":  # pragma: no cover - exercised by the executable smoke test
++    raise SystemExit(main())
+diff --git a/ros2_ws/src/perception_tracker/resource/perception_tracker b/ros2_ws/src/perception_tracker/resource/perception_tracker
+new file mode 100644
+index 0000000..e69de29
+diff --git a/ros2_ws/src/perception_tracker/rviz/perception_tracker.rviz b/ros2_ws/src/perception_tracker/rviz/perception_tracker.rviz
+new file mode 100644
+index 0000000..48167f2
+--- /dev/null
++++ b/ros2_ws/src/perception_tracker/rviz/perception_tracker.rviz
+@@ -0,0 +1,34 @@
++Panels:
++  - Class: rviz_common/Displays
++    Name: Displays
++  - Class: rviz_common/Views
++    Name: Views
++Visualization Manager:
++  Class: ""
++  Displays:
++    - Class: rviz_default_plugins/PointCloud2
++      Enabled: true
++      Name: LiDAR Points
++      Size (Pixels): 2
++      Style: Points
++      Topic:
++        Value: /sensors/lidar/points
++    - Class: rviz_default_plugins/MarkerArray
++      Enabled: true
++      Name: 3D Detections
++      Topic:
++        Value: /perception/detections
++    - Class: rviz_default_plugins/MarkerArray
++      Enabled: true
++      Name: Tracks and IDs
++      Topic:
++        Value: /perception/tracks
++  Global Options:
++    Fixed Frame: base_link
++    Frame Rate: 30
++  Views:
++    Current:
++      Class: rviz_default_plugins/Orbit
++      Distance: 60
++      Pitch: 0.6
++      Yaw: 0.8
+diff --git a/ros2_ws/src/perception_tracker/setup.cfg b/ros2_ws/src/perception_tracker/setup.cfg
+new file mode 100644
+index 0000000..4cc84a8
+--- /dev/null
++++ b/ros2_ws/src/perception_tracker/setup.cfg
+@@ -0,0 +1,4 @@
++[develop]
++script_dir=$base/lib/perception_tracker
++[install]
++install_scripts=$base/lib/perception_tracker
+diff --git a/ros2_ws/src/perception_tracker/setup.py b/ros2_ws/src/perception_tracker/setup.py
+new file mode 100644
+index 0000000..0e73d15
+--- /dev/null
++++ b/ros2_ws/src/perception_tracker/setup.py
+@@ -0,0 +1,24 @@
++from setuptools import find_packages, setup
++
++package_name = "perception_tracker"
++
++setup(
++    name=package_name,
++    version="0.1.0",
++    packages=find_packages(),
++    data_files=[
++        ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
++        ("share/" + package_name, ["package.xml"]),
++        ("share/" + package_name + "/launch", ["launch/perception_tracker.launch.py"]),
++        ("share/" + package_name + "/rviz", ["rviz/perception_tracker.rviz"]),
++    ],
++    install_requires=["setuptools"],
++    zip_safe=True,
++    description="Replay-oriented ROS2 adapter for robot-perception-mot.",
++    license="MIT",
++    entry_points={
++        "console_scripts": [
++            "perception_tracker_node = perception_tracker.perception_tracker_node:main",
++        ],
++    },
++)
+diff --git a/scripts/ros2_smoke_test.py b/scripts/ros2_smoke_test.py
+new file mode 100644
+index 0000000..cbed326
+--- /dev/null
++++ b/scripts/ros2_smoke_test.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/env python3
++"""Run the ROS2 package's dependency-light executable smoke test."""
++
++from __future__ import annotations
++
++from pathlib import Path
++import subprocess
++import sys
++
++
++def main() -> int:
++    package_src = Path(__file__).resolve().parents[1] / "ros2_ws" / "src" / "perception_tracker"
++    module_path = package_src / "perception_tracker"
++    env = dict(__import__("os").environ)
++    env["PYTHONPATH"] = str(package_src) + ":" + env.get("PYTHONPATH", "")
++    python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
++    result = subprocess.run([python, str(module_path / "perception_tracker_node.py"), "--smoke"], env=env)
++    return result.returncode
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_ros2_smoke.py b/tests/test_ros2_smoke.py
+new file mode 100644
+index 0000000..6dd1b9b
+--- /dev/null
++++ b/tests/test_ros2_smoke.py
+@@ -0,0 +1,25 @@
++"""Static and executable checks for the ROS2 adapter package."""
++
++from __future__ import annotations
++
++from pathlib import Path
++import subprocess
++import sys
++
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def test_ros2_package_layout() -> None:
++    package = ROOT / "ros2_ws" / "src" / "perception_tracker"
++    assert (package / "package.xml").is_file()
++    assert (package / "setup.py").is_file()
++    assert (package / "perception_tracker" / "perception_tracker_node.py").is_file()
++    assert (package / "launch" / "perception_tracker.launch.py").is_file()
++
++
++def test_ros2_entrypoint_smoke() -> None:
++    script = ROOT / "scripts" / "ros2_smoke_test.py"
++    result = subprocess.run([sys.executable, str(script)], cwd=ROOT, capture_output=True, text=True)
++    assert result.returncode == 0, result.stderr or result.stdout
++    assert "smoke test passed" in result.stdout

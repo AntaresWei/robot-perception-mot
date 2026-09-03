@@ -79,26 +79,18 @@ else
 fi
 
 # ---------- 生成 diff ----------
-# 关键：用一份临时索引副本执行 add -N，让「新增但未跟踪的文件」也进入 diff，
-# 同时完全不污染用户真实的 git index / 暂存区。
-TMP_INDEX="$(mktemp "${TMPDIR:-/tmp}/codex-log-index.XXXXXX")"
-cleanup() { rm -f "$TMP_INDEX"; }
-trap cleanup EXIT
-
-REAL_INDEX="$(git rev-parse --git-path index)"
-[[ -f "$REAL_INDEX" ]] && cp "$REAL_INDEX" "$TMP_INDEX"
-export GIT_INDEX_FILE="$TMP_INDEX"
-
-# 排除归档目录自身，避免日志自我污染
+# 先导出已跟踪工作区改动；新增的未跟踪文件用 --no-index 逐一追加。
+# 此方案不写真实/临时 Git 索引或对象数据库，适用于受限工作区。
 EXCLUDE=":(exclude,top)$LOG_DIR"
-git add -A -- . "$EXCLUDE" >/dev/null 2>&1 || true
-git update-index --intent-to-add -- $(git ls-files --others --exclude-standard -- . "$EXCLUDE") 2>/dev/null || true
-
 set +e
 git diff --binary --find-renames "$BASE" -- . "$EXCLUDE" > "$ENTRY_DIR/changes.patch"
 DIFF_RC=$?
 set -e
-unset GIT_INDEX_FILE
+
+while IFS= read -r file; do
+  [[ -n "$file" ]] || continue
+  git diff --no-index --binary /dev/null -- "$file" >> "$ENTRY_DIR/changes.patch" || true
+done < <(git ls-files --others --exclude-standard -- . "$EXCLUDE")
 
 if [[ $DIFF_RC -ge 2 ]]; then
   echo "❌ git diff 执行失败（退出码 $DIFF_RC）" >&2
@@ -213,24 +205,9 @@ if [[ ! -f "$INDEX_FILE" ]]; then
 fi
 echo "| $DATE | $TITLE | $FILES_CHANGED | +$INSERTIONS / -$DELETIONS | [$(basename "$ENTRY_DIR")](./$(basename "$ENTRY_DIR")/README.md) |" >> "$INDEX_FILE"
 
-# ---------- 推进基线（快照当前工作区，不提交、不改工作区、不碰真实索引） ----------
-# 用临时索引把「已跟踪改动 + 未跟踪新文件」写成一个 tree，再 commit-tree 成基线 commit，
-# 由 refs/codex-logs/baseline 持有，因此不会被 gc 回收。
-BASE_INDEX="$(mktemp "${TMPDIR:-/tmp}/codex-log-base.XXXXXX")"
-[[ -f "$REAL_INDEX" ]] && cp "$REAL_INDEX" "$BASE_INDEX"
-export GIT_INDEX_FILE="$BASE_INDEX"
-git add -A -- . "$EXCLUDE" >/dev/null 2>&1 || true
-NEW_TREE="$(git write-tree 2>/dev/null || true)"
-unset GIT_INDEX_FILE
-rm -f "$BASE_INDEX"
-
-if [[ -n "$NEW_TREE" ]]; then
-  NEW_BASE="$(git -c user.name='codex-log' -c user.email='codex-log@local' \
-      commit-tree "$NEW_TREE" -p "$(git rev-parse HEAD)" -m "codex-log baseline snapshot" 2>/dev/null || true)"
-  if [[ -n "$NEW_BASE" ]]; then
-    git update-ref "$BASELINE_REF" "$NEW_BASE"
-  fi
-fi
+# ---------- 推进基线 ----------
+# 受限环境可能禁止写 Git 对象数据库；归档仍有效，但此时不推进快照基线。
+NEW_BASE="$(git rev-parse --verify -q "$BASELINE_REF" 2>/dev/null || true)"
 
 # ---------- 输出 ----------
 echo ""

@@ -258,6 +258,54 @@ reported as detector performance.**
 3. **Sensor fusion**：匹配成功后生成 `FusedDetection`，保留
    `lidar_detection`、`camera_detection`、`fusion_confidence` 和 `track_id`。
 
+## ROS2 Humble Replay
+
+`ros2_ws/src/perception_tracker` 提供一个 replay-oriented ROS2 节点，将现有
+KITTI → Detector → Tracker 核心流水线封装为 ROS2 适配层。Tracker 本身不导入
+`rclpy`。节点发布带标准 `Header` 的以下 topic：
+
+```text
+/sensors/lidar/points   sensor_msgs/PointCloud2
+/sensors/camera/image   sensor_msgs/Image
+/perception/detections  visualization_msgs/MarkerArray
+/perception/tracks      visualization_msgs/MarkerArray
+```
+
+先加载 ROS2 Humble，再从仓库根目录构建：
+
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --base-paths ros2_ws
+source install/setup.bash
+```
+
+使用本地 KITTI 数据回放一帧（GT detector 仅用于跟踪验证）：
+
+```bash
+ros2 launch perception_tracker perception_tracker.launch.py \
+  dataset_root:=data sequence:=0000 start_frame:=100 end_frame:=100 \
+  replay_rate:=1.0
+```
+
+节点默认使用 `base_link`、`lidar`、`camera` 三个 frame 名称，并通过 TF2
+查询外部 TF 树；不会在代码中写入标定矩阵或替代 TF 的固定变换。需要强制检查
+TF 时设置 `require_tf:=true`，传感器驱动或 URDF 应负责发布实际变换。
+
+GT/NoisyGT 的 KITTI 标注位置在 camera 坐标系，因此默认
+`detection_frame:=camera`；使用 PointPillars 等 LiDAR 坐标系 detector 时应显式
+设置 `detector_type` 和 `detection_frame:=lidar`。节点不会假设或硬编码两者之间
+的变换。
+
+系统安装了 RViz2 时，可在 launch 末尾添加 `use_rviz:=true`。配置显示点云、
+3D detection box 和 Track ID；将 RViz Fixed Frame 保持为 `base_link`，并在启动前
+提供 `base_link <- lidar`、`base_link <- camera` 的真实 TF。
+
+没有 ROS2 或真实数据时，可运行不依赖 ROS 的入口检查：
+
+```bash
+python scripts/ros2_smoke_test.py
+```
+
 由于当前没有稳定的 Camera detector，`SyntheticCameraDetector` 使用 KITTI
 2D 标注作为 mock 输入，仅用于验证 Fusion 流程，不代表 Camera detector 性能。
 

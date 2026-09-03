@@ -1,0 +1,34 @@
+# 变更清单
+
+基线 `3b26b739eba1fbf671953ea7eb5761c4ab682ee8` → 当前工作区 ｜ 14 个文件，+613 / -34
+
+```
+3	1	.gitignore
+48	0	README.md
+10	33	scripts/codex-log.sh
+62	0	ros2_ws/src/perception_tracker/launch/perception_tracker.launch.py
+25	0	ros2_ws/src/perception_tracker/package.xml
+3	0	ros2_ws/src/perception_tracker/perception_tracker/__init__.py
+308	0	ros2_ws/src/perception_tracker/perception_tracker/node.py
+45	0	ros2_ws/src/perception_tracker/perception_tracker/perception_tracker_node.py
+0	0	ros2_ws/src/perception_tracker/resource/perception_tracker
+34	0	ros2_ws/src/perception_tracker/rviz/perception_tracker.rviz
+4	0	ros2_ws/src/perception_tracker/setup.cfg
+24	0	ros2_ws/src/perception_tracker/setup.py
+22	0	scripts/ros2_smoke_test.py
+25	0	tests/test_ros2_smoke.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- ros2_ws/src/perception_tracker/launch/perception_tracker.launch.py
+- ros2_ws/src/perception_tracker/package.xml
+- ros2_ws/src/perception_tracker/perception_tracker/__init__.py
+- ros2_ws/src/perception_tracker/perception_tracker/node.py
+- ros2_ws/src/perception_tracker/perception_tracker/perception_tracker_node.py
+- ros2_ws/src/perception_tracker/resource/perception_tracker
+- ros2_ws/src/perception_tracker/rviz/perception_tracker.rviz
+- ros2_ws/src/perception_tracker/setup.cfg
+- ros2_ws/src/perception_tracker/setup.py
+- scripts/ros2_smoke_test.py
+- tests/test_ros2_smoke.py
