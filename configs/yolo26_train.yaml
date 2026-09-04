@@ -1,0 +1,13 @@
+# 在 /tmp/robot-perception-mot-yolo26 临时环境中使用的 YOLO26 KITTI 三类训练配置。
+model: weights/yolo26s.pt
+data: configs/yolo26_kitti.yaml
+epochs: 30
+imgsz: 640
+batch: 16
+device: 0
+workers: 4
+patience: 10
+seed: 7
+project: outputs/training
+name: yolo26s_kitti3class
+output_weight: weights/yolo26s_kitti3class.pt

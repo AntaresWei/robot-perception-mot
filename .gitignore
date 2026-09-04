@@ -34,13 +34,17 @@ data/*
 # Weights
 # =====================
 *.pth
+weights/*.pt
+weights/*.onnx
+weights/**/*.pt
+weights/**/*.onnx
 
 # =====================
 # Outputs
 # =====================
 outputs/logs/*
 outputs/metrics/*
-outputs/visualizations/*
+outputs/training/*
 
 # =====================
 # Media files

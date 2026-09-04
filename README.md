@@ -210,9 +210,11 @@ LiDAR xyz --Tr_velo_to_cam--> Camera
 
 ### Real detector experiment
 
-本地已完成官方 PointPillars KITTI checkpoint 的单帧 adapter 接入验证；本仓库**没有**
-已生成的真实 Detector 全序列 mAP、recall、端到端 MOT 或 GPU memory 实验结果，
-因此 README 不报告这些指标。
+本地已完成官方 PointPillars KITTI checkpoint 的单帧和 `0000` 全序列端到端接入验证。
+YOLO26 2D detector 使用 KITTI 三类标签微调后导出 ONNX，由主项目环境的 OpenCV DNN
+加载；PointPillars 3D detector 保持在独立的 `mmdet3d-kitti` 环境。真实 detector 的
+全序列运行统计写入 `outputs/metrics/end_to_end_0000.json`；这不是 detector mAP/recall
+benchmark，后者仍需单独按 KITTI 官方评估协议计算。
 
 旧版 PointPillars 必须使用独立环境，避免破坏主项目：
 
@@ -240,6 +242,18 @@ unset HTTP_PROXY HTTPS_PROXY
 
 版本组合必须保持：Python 3.8、PyTorch 1.10.0+cu113、MMCV 1.6.0、
 MMDetection 2.28.2、MMDetection3D 1.0.0rc6、NumPy 1.20.3、Pillow 9.5.0。
+
+YOLO26 的训练和 ONNX 导出使用从主环境继承依赖的临时 venv，不向
+`robot-perception-mot` 安装 Ultralytics：
+
+```bash
+python -m venv --system-site-packages /tmp/robot-perception-mot-yolo26
+/tmp/robot-perception-mot-yolo26/bin/python -m pip install \
+  ultralytics==8.4.131 onnx==1.16.0
+```
+
+统一权重目录为 `weights/`，包含原始 `yolo26s.pt`、训练后的
+`yolo26s_kitti3class.pt`/`.onnx` 和 PointPillars `.pth`；这些大文件均被 Git 忽略。
 
 官方配置和三分类 checkpoint（`Pedestrian/Cyclist/Car`）下载地址：
 
@@ -275,6 +289,23 @@ CUDA_VISIBLE_DEVICES=0 python mmdetection3d-1.0/demo/pcd_demo.py \
 CUDA_VISIBLE_DEVICES=0 python scripts/run_detection.py \
   --detector real --sequence 0000 --frame 100
 ```
+
+### YOLO26 KITTI 三类训练与 ONNX
+
+`yolo26s.pt` 是 COCO 预训练模型，先由 `scripts/prepare_kitti_yolo.py` 将 KITTI
+`label_02` 转成 YOLO 格式，再在临时环境训练三类 head。当前已生成 8,008 帧、45,198
+个框的训练集（17 个 train sequence、4 个 val sequence，图像使用符号链接）：
+
+```bash
+python scripts/prepare_kitti_yolo.py --output data/yolo26_kitti_trainset
+/tmp/robot-perception-mot-yolo26/bin/python scripts/train_yolo26_kitti.py \
+  --epochs 10 --device 0
+/tmp/robot-perception-mot-yolo26/bin/python scripts/export_yolo26_onnx.py
+```
+
+训练配置位于 `configs/yolo26_train.yaml`，数据类别顺序固定为：`Car`、`Pedestrian`、
+`Cyclist`。本次 10 epoch 实际验证结果为 Precision `0.62777`、Recall `0.53965`、
+mAP50 `0.53000`、mAP50-95 `0.32233`；这是 2D detector 验证结果，不等同于 MOT 指标。
 
 ## 12. Kalman Filter
 
@@ -362,6 +393,42 @@ ros2 launch perception_tracker perception_tracker.launch.py \
 安装 RViz2 后可追加 `use_rviz:=true`。GT/NoisyGT replay 的 detection 位于 camera
 frame；LiDAR Detector 输出必须显式设置 `detection_frame:=lidar`。
 
+### 真实端到端 replay
+
+在 `mmdet3d-kitti` 环境中运行统一脚本，PointPillars 生成 LiDAR 3D box，YOLO26 ONNX
+生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+  scripts/run_end_to_end.py --sequence 0000 --device cuda:0
+```
+
+最近一次真实运行处理 154 帧：PointPillars 输出 1,594 个 3D detections，YOLO26 输出
+727 个 2D detections，确认轨迹 1,214 个，融合结果 482 个；端到端耗时 16.49 秒，
+约 9.34 FPS，平均单帧 94.18 ms（包含两侧 detector、Tracker、projection、fusion
+和视频写入）。运行统计完整保存在 `outputs/metrics/end_to_end_0000.json`。
+
+这里的“端到端”指真实 detector 到融合输出的完整 replay：PointPillars 使用 KITTI
+原始 `.bin`（不额外做会改变其训练分布的 ground removal），YOLO26 使用 KITTI 三类
+相机图像，Tracker 只消费 PointPillars 的 `Detection3D`，最后使用 calibration 将
+LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
+但没有偷偷插入真实 PointPillars 推理链。
+
+### 真实端到端 replay
+
+在 `mmdet3d-kitti` 环境中运行统一脚本，PointPillars 生成 LiDAR 3D box，YOLO26 ONNX
+生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+  scripts/run_end_to_end.py --sequence 0000 --device cuda:0
+```
+
+输出 `outputs/videos/end_to_end_0000.mp4` 和 `outputs/metrics/end_to_end_0000.json`。
+最近一次真实运行处理 154 帧：PointPillars 输出 1,594 个 3D detections，YOLO26 输出
+727 个 2D detections，确认轨迹 1,214 个，融合结果 482 个；端到端耗时 34.13 秒，
+约 4.51 FPS（包含两侧 detector、Tracker、projection、fusion 和视频写入）。
+
 ## 17. Benchmark
 
 运行：
@@ -428,8 +495,9 @@ python scripts/render_fusion_video.py --sequence 0000
 
 ## 20. Limitations
 
-- 当前 benchmark 使用 GT/NoisyGT 输入；没有真实 Detector 的全序列 mAP、recall、
-  GPU memory 或端到端 MOT 结果。
+- MOT benchmark 的三个 baseline 仍使用 GT/NoisyGT 输入；它们验证 tracking/association，
+  不代表真实 detector 性能。PointPillars + YOLO26 全序列 replay 已可运行，但尚未计算
+  标准 detector mAP/recall 或真实 detector 驱动的 MOT ground-truth 评估。
 - `SyntheticCameraDetector` 是实验 mock，Camera-LiDAR fusion 目前是几何投影、
   跨模态匹配与规则置信度，不是 neural fusion。
 - 当前 IDF1 为基于逐帧位置匹配的可复现 baseline，不替代 MOTChallenge 全局 ID 指标。
@@ -439,9 +507,9 @@ python scripts/render_fusion_video.py --sequence 0000
 
 ## 21. Future Work
 
-1. 缓存真实 PointPillars 全序列输出，在相同 detection input 下执行端到端 MOT
-   benchmark，并记录真实 detector runtime/GPU memory。
-2. 接入稳定的 Camera 2D detector，替换 SyntheticCameraDetector，并评估跨模态匹配。
+1. 缓存真实 PointPillars + YOLO26 全序列输出，在相同 detection input 下执行端到端 MOT
+   benchmark，并记录 detector runtime/GPU memory。
+2. 增加 YOLO26 训练增强、类别/遮挡分层评估，并替换当前 10 epoch 实验权重为正式模型。
 3. 实现标准 MOTChallenge 全局 IDF1 与更完整的误差分析。
 4. 连接真实 ROS2 传感器 topic、TF tree 和时间同步，执行 RViz2 集成测试。
 5. 在不破坏模块边界的前提下增加类别一致性 gating、检测缓存和性能 profiling。

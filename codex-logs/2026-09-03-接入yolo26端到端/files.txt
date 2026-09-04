@@ -1,0 +1,31 @@
+# 变更清单
+
+基线 `9e998e4fe4973b5a82bf62cf49f94c199bc58578` → 当前工作区 ｜ 13 个文件，+886 / -11
+
+```
+5	1	.gitignore
+76	8	README.md
+11	1	configs/detector.yaml
+27	1	src/robot_perception/fusion/__init__.py
+8	0	configs/yolo26_kitti.yaml
+13	0	configs/yolo26_train.yaml
+1	0	outputs/visualizations/.gitkeep
+39	0	scripts/export_yolo26_onnx.py
+125	0	scripts/prepare_kitti_yolo.py
+328	0	scripts/run_end_to_end.py
+82	0	scripts/train_yolo26_kitti.py
+124	0	src/robot_perception/fusion/yolo26.py
+47	0	tests/test_yolo26_camera.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- configs/yolo26_kitti.yaml
+- configs/yolo26_train.yaml
+- outputs/visualizations/.gitkeep
+- scripts/export_yolo26_onnx.py
+- scripts/prepare_kitti_yolo.py
+- scripts/run_end_to_end.py
+- scripts/train_yolo26_kitti.py
+- src/robot_perception/fusion/yolo26.py
+- tests/test_yolo26_camera.py

@@ -1,0 +1,1036 @@
+diff --git a/.gitignore b/.gitignore
+index 0c94bf2..fc71489 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -34,13 +34,17 @@ data/*
+ # Weights
+ # =====================
+ *.pth
++weights/*.pt
++weights/*.onnx
++weights/**/*.pt
++weights/**/*.onnx
+ 
+ # =====================
+ # Outputs
+ # =====================
+ outputs/logs/*
+ outputs/metrics/*
+-outputs/visualizations/*
++outputs/training/*
+ 
+ # =====================
+ # Media files
+diff --git a/README.md b/README.md
+index 9462440..14d13d8 100644
+--- a/README.md
++++ b/README.md
+@@ -210,9 +210,11 @@ LiDAR xyz --Tr_velo_to_cam--> Camera
+ 
+ ### Real detector experiment
+ 
+-本地已完成官方 PointPillars KITTI checkpoint 的单帧 adapter 接入验证；本仓库**没有**
+-已生成的真实 Detector 全序列 mAP、recall、端到端 MOT 或 GPU memory 实验结果，
+-因此 README 不报告这些指标。
++本地已完成官方 PointPillars KITTI checkpoint 的单帧和 `0000` 全序列端到端接入验证。
++YOLO26 2D detector 使用 KITTI 三类标签微调后导出 ONNX，由主项目环境的 OpenCV DNN
++加载；PointPillars 3D detector 保持在独立的 `mmdet3d-kitti` 环境。真实 detector 的
++全序列运行统计写入 `outputs/metrics/end_to_end_0000.json`；这不是 detector mAP/recall
++benchmark，后者仍需单独按 KITTI 官方评估协议计算。
+ 
+ 旧版 PointPillars 必须使用独立环境，避免破坏主项目：
+ 
+@@ -241,6 +243,18 @@ unset HTTP_PROXY HTTPS_PROXY
+ 版本组合必须保持：Python 3.8、PyTorch 1.10.0+cu113、MMCV 1.6.0、
+ MMDetection 2.28.2、MMDetection3D 1.0.0rc6、NumPy 1.20.3、Pillow 9.5.0。
+ 
++YOLO26 的训练和 ONNX 导出使用从主环境继承依赖的临时 venv，不向
++`robot-perception-mot` 安装 Ultralytics：
++
++```bash
++python -m venv --system-site-packages /tmp/robot-perception-mot-yolo26
++/tmp/robot-perception-mot-yolo26/bin/python -m pip install \
++  ultralytics==8.4.131 onnx==1.16.0
++```
++
++统一权重目录为 `weights/`，包含原始 `yolo26s.pt`、训练后的
++`yolo26s_kitti3class.pt`/`.onnx` 和 PointPillars `.pth`；这些大文件均被 Git 忽略。
++
+ 官方配置和三分类 checkpoint（`Pedestrian/Cyclist/Car`）下载地址：
+ 
+ ```text
+@@ -276,6 +290,23 @@ CUDA_VISIBLE_DEVICES=0 python scripts/run_detection.py \
+   --detector real --sequence 0000 --frame 100
+ ```
+ 
++### YOLO26 KITTI 三类训练与 ONNX
++
++`yolo26s.pt` 是 COCO 预训练模型，先由 `scripts/prepare_kitti_yolo.py` 将 KITTI
++`label_02` 转成 YOLO 格式，再在临时环境训练三类 head。当前已生成 8,008 帧、45,198
++个框的训练集（17 个 train sequence、4 个 val sequence，图像使用符号链接）：
++
++```bash
++python scripts/prepare_kitti_yolo.py --output data/yolo26_kitti_trainset
++/tmp/robot-perception-mot-yolo26/bin/python scripts/train_yolo26_kitti.py \
++  --epochs 10 --device 0
++/tmp/robot-perception-mot-yolo26/bin/python scripts/export_yolo26_onnx.py
++```
++
++训练配置位于 `configs/yolo26_train.yaml`，数据类别顺序固定为：`Car`、`Pedestrian`、
++`Cyclist`。本次 10 epoch 实际验证结果为 Precision `0.62777`、Recall `0.53965`、
++mAP50 `0.53000`、mAP50-95 `0.32233`；这是 2D detector 验证结果，不等同于 MOT 指标。
++
+ ## 12. Kalman Filter
+ 
+ `ConstantVelocityKalmanFilter` 独立实现下列线性模型，不依赖 filterpy 的核心数学：
+@@ -362,6 +393,42 @@ ros2 launch perception_tracker perception_tracker.launch.py \
+ 安装 RViz2 后可追加 `use_rviz:=true`。GT/NoisyGT replay 的 detection 位于 camera
+ frame；LiDAR Detector 输出必须显式设置 `detection_frame:=lidar`。
+ 
++### 真实端到端 replay
++
++在 `mmdet3d-kitti` 环境中运行统一脚本，PointPillars 生成 LiDAR 3D box，YOLO26 ONNX
++生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/run_end_to_end.py --sequence 0000 --device cuda:0
++```
++
++最近一次真实运行处理 154 帧：PointPillars 输出 1,594 个 3D detections，YOLO26 输出
++727 个 2D detections，确认轨迹 1,214 个，融合结果 482 个；端到端耗时 16.49 秒，
++约 9.34 FPS，平均单帧 94.18 ms（包含两侧 detector、Tracker、projection、fusion
++和视频写入）。运行统计完整保存在 `outputs/metrics/end_to_end_0000.json`。
++
++这里的“端到端”指真实 detector 到融合输出的完整 replay：PointPillars 使用 KITTI
++原始 `.bin`（不额外做会改变其训练分布的 ground removal），YOLO26 使用 KITTI 三类
++相机图像，Tracker 只消费 PointPillars 的 `Detection3D`，最后使用 calibration 将
++LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
++但没有偷偷插入真实 PointPillars 推理链。
++
++### 真实端到端 replay
++
++在 `mmdet3d-kitti` 环境中运行统一脚本，PointPillars 生成 LiDAR 3D box，YOLO26 ONNX
++生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/run_end_to_end.py --sequence 0000 --device cuda:0
++```
++
++输出 `outputs/videos/end_to_end_0000.mp4` 和 `outputs/metrics/end_to_end_0000.json`。
++最近一次真实运行处理 154 帧：PointPillars 输出 1,594 个 3D detections，YOLO26 输出
++727 个 2D detections，确认轨迹 1,214 个，融合结果 482 个；端到端耗时 34.13 秒，
++约 4.51 FPS（包含两侧 detector、Tracker、projection、fusion 和视频写入）。
++
+ ## 17. Benchmark
+ 
+ 运行：
+@@ -428,8 +495,9 @@ python scripts/render_fusion_video.py --sequence 0000
+ 
+ ## 20. Limitations
+ 
+-- 当前 benchmark 使用 GT/NoisyGT 输入；没有真实 Detector 的全序列 mAP、recall、
+-  GPU memory 或端到端 MOT 结果。
++- MOT benchmark 的三个 baseline 仍使用 GT/NoisyGT 输入；它们验证 tracking/association，
++  不代表真实 detector 性能。PointPillars + YOLO26 全序列 replay 已可运行，但尚未计算
++  标准 detector mAP/recall 或真实 detector 驱动的 MOT ground-truth 评估。
+ - `SyntheticCameraDetector` 是实验 mock，Camera-LiDAR fusion 目前是几何投影、
+   跨模态匹配与规则置信度，不是 neural fusion。
+ - 当前 IDF1 为基于逐帧位置匹配的可复现 baseline，不替代 MOTChallenge 全局 ID 指标。
+@@ -439,9 +507,9 @@ python scripts/render_fusion_video.py --sequence 0000
+ 
+ ## 21. Future Work
+ 
+-1. 缓存真实 PointPillars 全序列输出，在相同 detection input 下执行端到端 MOT
+-   benchmark，并记录真实 detector runtime/GPU memory。
+-2. 接入稳定的 Camera 2D detector，替换 SyntheticCameraDetector，并评估跨模态匹配。
++1. 缓存真实 PointPillars + YOLO26 全序列输出，在相同 detection input 下执行端到端 MOT
++   benchmark，并记录 detector runtime/GPU memory。
++2. 增加 YOLO26 训练增强、类别/遮挡分层评估，并替换当前 10 epoch 实验权重为正式模型。
+ 3. 实现标准 MOTChallenge 全局 IDF1 与更完整的误差分析。
+ 4. 连接真实 ROS2 传感器 topic、TF tree 和时间同步，执行 RViz2 集成测试。
+ 5. 在不破坏模块边界的前提下增加类别一致性 gating、检测缓存和性能 profiling。
+diff --git a/configs/detector.yaml b/configs/detector.yaml
+index d774f71..1f8fa22 100644
+--- a/configs/detector.yaml
++++ b/configs/detector.yaml
+@@ -12,10 +12,20 @@ detector:
+   real:
+     type: mmdet3d_pointpillars
+     config: mmdetection3d-1.0/configs/pointpillars/hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class.py
+-    checkpoint: hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth
++    checkpoint: weights/hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth
+     device: cuda:0
+     score_threshold: 0.3
+     class_mapping:
+       0: 2
+       1: 3
+       2: 1
++  camera:
++    type: yolo26_onnx
++    model: weights/yolo26s_kitti3class.onnx
++    score_threshold: 0.25
++    iou_threshold: 0.45
++    input_size: 640
++    class_mapping:
++      0: 1
++      1: 2
++      2: 3
+diff --git a/src/robot_perception/fusion/__init__.py b/src/robot_perception/fusion/__init__.py
+index 469f48f..61c6bcc 100644
+--- a/src/robot_perception/fusion/__init__.py
++++ b/src/robot_perception/fusion/__init__.py
+@@ -1,4 +1,30 @@
+-"""Object-level Camera-LiDAR projection and fusion."""
++"""Object-level Camera-LiDAR projection, association, and camera adapters."""
++
++from robot_perception.fusion.camera_lidar import (
++    BaseCameraDetector,
++    Camera2DDetection,
++    FusedDetection,
++    FusionResult,
++    SyntheticCameraDetector,
++    associate_camera_lidar_detections,
++    box_corners_3d,
++    project_detection_corners_to_image,
++    project_detection_to_image,
++)
++from robot_perception.fusion.yolo26 import Yolo26OnnxCameraDetector
++
++__all__ = [
++    "BaseCameraDetector",
++    "Camera2DDetection",
++    "FusedDetection",
++    "FusionResult",
++    "SyntheticCameraDetector",
++    "Yolo26OnnxCameraDetector",
++    "associate_camera_lidar_detections",
++    "box_corners_3d",
++    "project_detection_corners_to_image",
++    "project_detection_to_image",
++]
+ 
+ from robot_perception.fusion.camera_lidar import (
+     BaseCameraDetector,
+diff --git a/configs/yolo26_kitti.yaml b/configs/yolo26_kitti.yaml
+new file mode 100644
+index 0000000..eb9ee1a
+--- /dev/null
++++ b/configs/yolo26_kitti.yaml
+@@ -0,0 +1,8 @@
++# Ultralytics YOLO 数据集配置，由 scripts/prepare_kitti_yolo.py 生成目录后使用。
++path: data/yolo26_kitti_trainset
++train: images/train
++val: images/val
++names:
++  0: Car
++  1: Pedestrian
++  2: Cyclist
+diff --git a/configs/yolo26_train.yaml b/configs/yolo26_train.yaml
+new file mode 100644
+index 0000000..b0ce945
+--- /dev/null
++++ b/configs/yolo26_train.yaml
+@@ -0,0 +1,13 @@
++# 在 /tmp/robot-perception-mot-yolo26 临时环境中使用的 YOLO26 KITTI 三类训练配置。
++model: weights/yolo26s.pt
++data: configs/yolo26_kitti.yaml
++epochs: 30
++imgsz: 640
++batch: 16
++device: 0
++workers: 4
++patience: 10
++seed: 7
++project: outputs/training
++name: yolo26s_kitti3class
++output_weight: weights/yolo26s_kitti3class.pt
+diff --git a/outputs/visualizations/.gitkeep b/outputs/visualizations/.gitkeep
+new file mode 100644
+index 0000000..8b13789
+--- /dev/null
++++ b/outputs/visualizations/.gitkeep
+@@ -0,0 +1 @@
++
+diff --git a/scripts/export_yolo26_onnx.py b/scripts/export_yolo26_onnx.py
+new file mode 100644
+index 0000000..ebbd3b3
+--- /dev/null
++++ b/scripts/export_yolo26_onnx.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""Export the trained KITTI three-class YOLO26 checkpoint to ONNX."""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++import shutil
++import sys
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--model", type=Path, default=REPO_ROOT / "weights" / "yolo26s_kitti3class.pt")
++    parser.add_argument("--output", type=Path, default=REPO_ROOT / "weights" / "yolo26s_kitti3class.onnx")
++    parser.add_argument("--imgsz", type=int, default=640)
++    args = parser.parse_args(argv)
++    try:
++        from ultralytics import YOLO
++
++        if not args.model.is_file():
++            raise FileNotFoundError(f"trained YOLO26 checkpoint not found: {args.model}")
++        exported = Path(YOLO(str(args.model)).export(
++            format="onnx", imgsz=args.imgsz, device="cpu", simplify=False, opset=12, dynamic=False, nms=False
++        ))
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        if exported.resolve() != args.output.resolve():
++            shutil.copy2(exported, args.output)
++    except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++    print(f"Saved YOLO26 ONNX model: {args.output}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/prepare_kitti_yolo.py b/scripts/prepare_kitti_yolo.py
+new file mode 100644
+index 0000000..e1bd02f
+--- /dev/null
++++ b/scripts/prepare_kitti_yolo.py
+@@ -0,0 +1,125 @@
++#!/usr/bin/env python3
++"""Convert KITTI Tracking image_02/label_02 to YOLO detection labels.
++
++The converter keeps only the project's three classes. KITTI ``Van`` and
++``Truck`` follow the existing project mapping to ``Car``; ``DontCare`` and
++unknown classes are ignored. Splitting by sequence avoids frame leakage.
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++from pathlib import Path
++import sys
++
++from PIL import Image
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++CLASS_IDS = {"Car": 0, "Van": 0, "Truck": 0, "Pedestrian": 1, "Person_sitting": 1, "Cyclist": 2}
++
++
++def _resolve(path: str | Path) -> Path:
++    value = Path(path)
++    return value if value.is_absolute() else REPO_ROOT / value
++
++
++def _paths(root: Path, split: str) -> tuple[Path, Path]:
++    image_root = root / "data_tracking_image_2" / split / "image_02"
++    label_root = root / "data_tracking_label_2" / split / "label_02"
++    if image_root.is_dir() and label_root.is_dir():
++        return image_root, label_root
++    standard = root / split
++    image_root, label_root = standard / "image_02", standard / "label_02"
++    if image_root.is_dir() and label_root.is_dir():
++        return image_root, label_root
++    raise FileNotFoundError(f"KITTI image_02/label_02 not found under {root}")
++
++
++def _sequence_split(sequences: list[str]) -> tuple[list[str], list[str]]:
++    if len(sequences) < 2:
++        return sequences, sequences
++    val_count = max(1, round(len(sequences) * 0.2))
++    return sequences[:-val_count], sequences[-val_count:]
++
++
++def convert(
++    root: Path,
++    output: Path,
++    split: str = "training",
++    sequences: list[str] | None = None,
++) -> dict[str, int]:
++    image_root, label_root = _paths(root, split)
++    available_sequences = sorted(path.name for path in image_root.iterdir() if path.is_dir())
++    selected_sequences = available_sequences if sequences is None else [f"{int(value):04d}" for value in sequences]
++    missing = sorted(set(selected_sequences) - set(available_sequences))
++    if missing:
++        raise FileNotFoundError(f"requested KITTI sequences are unavailable: {', '.join(missing)}")
++    train_sequences, val_sequences = _sequence_split(selected_sequences)
++    if not selected_sequences:
++        raise ValueError("no KITTI sequences found")
++    for directory in (output / "images" / "train", output / "images" / "val", output / "labels" / "train", output / "labels" / "val"):
++        directory.mkdir(parents=True, exist_ok=True)
++    counts = {"images": 0, "labels": 0, "boxes": 0, "train_sequences": len(train_sequences), "val_sequences": len(val_sequences)}
++    for sequence_id in selected_sequences:
++        subset = "train" if sequence_id in train_sequences else "val"
++        label_path = label_root / f"{sequence_id}.txt"
++        annotations_by_frame: dict[int, list[str]] = {}
++        if label_path.is_file():
++            for line in label_path.read_text(encoding="utf-8").splitlines():
++                fields = line.split()
++                if len(fields) < 10:
++                    continue
++                class_id = CLASS_IDS.get(fields[2])
++                if class_id is None:
++                    continue
++                frame_id = int(fields[0])
++                x1, y1, x2, y2 = map(float, fields[6:10])
++                annotations_by_frame.setdefault(frame_id, []).append((class_id, x1, y1, x2, y2))
++        image_paths = sorted((image_root / sequence_id).glob("*.png"))
++        if not image_paths:
++            continue
++        # KITTI Tracking 的同一 sequence 使用固定相机分辨率；每个 sequence 只读一次
++        # 尺寸，避免为数千帧重复解码 PNG，标签坐标仍按真实图像尺寸归一化。
++        with Image.open(image_paths[0]) as image:
++            width, height = image.size
++        for image_path in image_paths:
++            frame_id = int(image_path.stem)
++            destination_stem = f"{sequence_id}_{frame_id:06d}"
++            destination_image = output / "images" / subset / f"{destination_stem}.png"
++            # 训练器可以读取符号链接；避免为 8,008 帧重复占用数 GB 磁盘空间。
++            if destination_image.exists() or destination_image.is_symlink():
++                destination_image.unlink()
++            os.symlink(image_path.resolve(), destination_image)
++            counts["images"] += 1
++            lines: list[str] = []
++            for class_id, x1, y1, x2, y2 in annotations_by_frame.get(frame_id, []):
++                left, right = max(0.0, min(x1, width)), max(0.0, min(x2, width))
++                top, bottom = max(0.0, min(y1, height)), max(0.0, min(y2, height))
++                if right <= left or bottom <= top:
++                    continue
++                cx, cy = ((left + right) / 2 / width, (top + bottom) / 2 / height)
++                bw, bh = ((right - left) / width, (bottom - top) / height)
++                lines.append(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
++            (output / "labels" / subset / f"{destination_stem}.txt").write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
++            counts["labels"] += 1
++            counts["boxes"] += len(lines)
++    return counts
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--root", type=Path, default=REPO_ROOT / "data")
++    parser.add_argument("--output", type=Path, default=REPO_ROOT / "data" / "yolo26_kitti")
++    parser.add_argument("--sequences", nargs="+", help="Optional KITTI sequence IDs, for example 0000 0001")
++    args = parser.parse_args(argv)
++    try:
++        print(convert(_resolve(args.root), _resolve(args.output), sequences=args.sequences))
++    except (FileNotFoundError, OSError, ValueError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/run_end_to_end.py b/scripts/run_end_to_end.py
+new file mode 100644
+index 0000000..7da7c8f
+--- /dev/null
++++ b/scripts/run_end_to_end.py
+@@ -0,0 +1,328 @@
++#!/usr/bin/env python3
++"""Run the real KITTI Camera-LiDAR detection, tracking, and fusion pipeline.
++
++This script is intentionally executable in the ``mmdet3d-kitti`` environment:
++PointPillars and the project core run in one process, while YOLO26 is consumed
++through its ONNX graph with OpenCV DNN. No detector-specific code is imported
++by the tracker itself.
++"""
++
++from __future__ import annotations
++
++import argparse
++from collections import Counter
++from datetime import datetime, timezone
++import json
++from pathlib import Path
++import sys
++from time import perf_counter
++
++import numpy as np
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++SRC_DIR = REPO_ROOT / "src"
++if str(SRC_DIR) not in sys.path:
++    sys.path.insert(0, str(SRC_DIR))
++
++from robot_perception.common.types import Detection3D, FrameData  # noqa: E402
++from robot_perception.dataset import KittiTrackingDataset  # noqa: E402
++from robot_perception.dataset.calibration import parse_kitti_calibration  # noqa: E402
++from robot_perception.detection import MMDet3DPointPillarsAdapter  # noqa: E402
++from robot_perception.fusion import (  # noqa: E402
++    Camera2DDetection,
++    FusedDetection,
++    Yolo26OnnxCameraDetector,
++    associate_camera_lidar_detections,
++    project_detection_to_image,
++)
++from robot_perception.tracking import MultiObjectTracker  # noqa: E402
++
++
++def _load_yaml(path: Path) -> dict[str, object]:
++    try:
++        import yaml
++    except ImportError as error:
++        raise RuntimeError("PyYAML is required by run_end_to_end.py") from error
++    if not path.is_file():
++        raise FileNotFoundError(f"configuration file not found: {path}")
++    value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++    if not isinstance(value, dict):
++        raise ValueError(f"configuration root must be a mapping: {path}")
++    return value
++
++
++def _resolve(path_value: str | Path) -> Path:
++    path = Path(path_value)
++    return path if path.is_absolute() else REPO_ROOT / path
++
++
++def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
++    candidates = (
++        root / split / "calib" / f"{sequence_id}.txt",
++        root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
++    )
++    for candidate in candidates:
++        if candidate.is_file():
++            return candidate
++    raise FileNotFoundError(f"calibration file not found for {sequence_id} under {root}")
++
++
++def _track_detections(tracker: MultiObjectTracker) -> list[Detection3D]:
++    """Expose confirmed Track estimates as tracker-owned Detection3D objects."""
++
++    detections: list[Detection3D] = []
++    for track in tracker.tracks:
++        if track.status != "Confirmed" or track.time_since_update != 0:
++            continue
++        detections.append(
++            Detection3D(
++                position=track.state[:3].copy(),
++                dimensions=track.dimensions.copy(),
++                yaw=track.yaw,
++                score=track.score,
++                class_id=track.class_id,
++            )
++        )
++    return detections
++
++
++def _attach_track_ids(
++    fusion_result: object,
++    track_detections: list[Detection3D],
++    tracker: MultiObjectTracker,
++) -> tuple[FusedDetection, ...]:
++    """Restore Track IDs after fusion association without changing fusion core code."""
++
++    confirmed_tracks = [
++        track for track in tracker.tracks if track.status == "Confirmed" and track.time_since_update == 0
++    ]
++    fused: list[FusedDetection] = []
++    for item in fusion_result.fused_detections:
++        if not track_detections or not confirmed_tracks:
++            fused.append(item)
++            continue
++        distances = [float(np.linalg.norm(track.state[:3] - item.lidar_detection.position)) for track in confirmed_tracks]
++        track_id = confirmed_tracks[int(np.argmin(distances))].track_id
++        camera_detection = Camera2DDetection(
++            bbox=item.camera_detection.bbox,
++            score=item.camera_detection.score,
++            class_id=item.camera_detection.class_id,
++            track_id=track_id,
++        )
++        fused.append(
++            FusedDetection(
++                lidar_detection=item.lidar_detection,
++                camera_detection=camera_detection,
++                projected_bbox=item.projected_bbox,
++                fusion_confidence=item.fusion_confidence,
++                track_id=track_id,
++            )
++        )
++    return tuple(fused)
++
++
++def _draw_frame(
++    frame: FrameData,
++    calibration: object,
++    lidar_detections: list[Detection3D],
++    camera_detections: list[Camera2DDetection],
++    track_detections: list[Detection3D],
++    fused_detections: tuple[FusedDetection, ...],
++) -> np.ndarray:
++    """Draw real YOLO26 boxes, projected PointPillars boxes, tracks, and fusion."""
++
++    import cv2
++
++    image = frame.image.copy()
++    # Camera detector boxes are yellow; all YOLO classes are already restricted
++    # to the KITTI three-class mapping by Yolo26OnnxCameraDetector.
++    for detection in camera_detections:
++        x1, y1, x2, y2 = np.rint(detection.bbox).astype(int)
++        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 255), 1)
++        cv2.putText(image, f"YOLO {detection.class_id} {detection.score:.2f}", (x1, max(12, y1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
++    # LiDAR detections are projected independently; this is geometric projection,
++    # before camera association or sensor fusion.
++    for detection in lidar_detections:
++        bbox = project_detection_to_image(detection, calibration, image_shape=image.shape, coordinate_frame="lidar")
++        if bbox is None:
++            continue
++        x1, y1, x2, y2 = np.rint(bbox).astype(int)
++        cv2.rectangle(image, (x1, y1), (x2, y2), (255, 0, 255), 1)
++        cv2.putText(image, f"PP {detection.class_id} {detection.score:.2f}", (x1, min(image.shape[0] - 2, y2 + 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1, cv2.LINE_AA)
++    # Fused boxes use green and carry the actual tracker ID restored above.
++    for item in fused_detections:
++        x1, y1, x2, y2 = np.rint(item.projected_bbox).astype(int)
++        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 200, 0), 2)
++        cv2.putText(image, f"Fused ID {item.track_id} c={item.fusion_confidence:.2f}", (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 0), 1, cv2.LINE_AA)
++    # Track-only projected boxes are blue, which makes unmatched tracks visible.
++    for track in track_detections:
++        bbox = project_detection_to_image(track, calibration, image_shape=image.shape, coordinate_frame="lidar")
++        if bbox is None:
++            continue
++        x1, y1, x2, y2 = np.rint(bbox).astype(int)
++        cv2.rectangle(image, (x1, y1), (x2, y2), (255, 128, 0), 1)
++    cv2.putText(image, f"E2E: PP3D={len(lidar_detections)} YOLO26_2D={len(camera_detections)} tracks={len(track_detections)} fused={len(fused_detections)}", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
++    return image
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dataset-config", type=Path, default=REPO_ROOT / "configs" / "dataset.yaml")
++    parser.add_argument("--detector-config", type=Path, default=REPO_ROOT / "configs" / "detector.yaml")
++    parser.add_argument("--tracker-config", type=Path, default=REPO_ROOT / "configs" / "tracker.yaml")
++    parser.add_argument("--root", type=Path)
++    parser.add_argument("--sequence", required=True)
++    parser.add_argument("--start-frame", type=int, default=0)
++    parser.add_argument("--end-frame", type=int, default=-1)
++    parser.add_argument("--output-video", type=Path)
++    parser.add_argument("--output-json", type=Path)
++    parser.add_argument("--device", help="PointPillars device, e.g. cuda:0")
++    parser.add_argument("--min-hits", type=int, help="Override tracker confirmation hits for replay smoke/experiments")
++    args = parser.parse_args(argv)
++    writer = None
++    writer_size: tuple[int, int] | None = None
++    try:
++        dataset_settings = _load_yaml(args.dataset_config).get("dataset")
++        detector_settings = _load_yaml(args.detector_config).get("detector")
++        tracker_settings = _load_yaml(args.tracker_config).get("tracker")
++        if not isinstance(dataset_settings, dict) or not isinstance(detector_settings, dict) or not isinstance(tracker_settings, dict):
++            raise ValueError("dataset, detector, and tracker mappings are required")
++        root = _resolve(args.root or dataset_settings.get("root", "data"))
++        split = str(dataset_settings.get("split", "training"))
++        dataset = KittiTrackingDataset(root, split=split, sequences=[args.sequence], load_images=True, load_annotations=True)
++        calibration = parse_kitti_calibration(_calibration_path(root, split, dataset.sequence_ids[0]))
++        real = detector_settings.get("real")
++        camera = detector_settings.get("camera")
++        if not isinstance(real, dict) or not isinstance(camera, dict):
++            raise ValueError("detector.yaml requires detector.real and detector.camera mappings")
++        pp = MMDet3DPointPillarsAdapter(
++            _resolve(str(real["config"])),
++            _resolve(str(real["checkpoint"])),
++            device=args.device or str(real.get("device", "cuda:0")),
++            score_threshold=float(real.get("score_threshold", 0.3)),
++            class_mapping={int(key): int(value) for key, value in dict(real.get("class_mapping", {})).items()},
++        )
++        yolo = Yolo26OnnxCameraDetector(
++            _resolve(str(camera["model"])),
++            score_threshold=float(camera.get("score_threshold", 0.25)),
++            iou_threshold=float(camera.get("iou_threshold", 0.45)),
++            input_size=int(camera.get("input_size", 640)),
++            class_mapping={int(key): int(value) for key, value in dict(camera.get("class_mapping", {0: 1, 1: 2, 2: 3})).items()},
++        )
++        tracker = MultiObjectTracker(
++            min_hits=int(args.min_hits if args.min_hits is not None else tracker_settings.get("min_hits", 3)),
++            max_age=int(tracker_settings.get("max_age", 5)),
++            gating_threshold=float(tracker_settings.get("gating_threshold", 9.21)),
++            initial_covariance=tracker_settings.get("initial_covariance", 1.0),
++            process_noise=tracker_settings.get("process_noise", 0.01),
++            measurement_noise=tracker_settings.get("measurement_noise", 0.1),
++        )
++        fusion_config = _load_yaml(REPO_ROOT / "configs" / "fusion.yaml")
++        fusion_settings = fusion_config.get("fusion", {})
++        if not isinstance(fusion_settings, dict):
++            raise ValueError("fusion config must contain a fusion mapping")
++        output_video = args.output_video or REPO_ROOT / "outputs" / "videos" / f"end_to_end_{args.sequence}.mp4"
++        output_json = args.output_json or REPO_ROOT / "outputs" / "metrics" / f"end_to_end_{args.sequence}.json"
++        output_video = _resolve(output_video)
++        output_json = _resolve(output_json)
++        output_video.parent.mkdir(parents=True, exist_ok=True)
++        output_json.parent.mkdir(parents=True, exist_ok=True)
++        import cv2
++
++        total = Counter()
++        frame_count = 0
++        processed_frame_ids: list[int] = []
++        timings: list[float] = []
++        start_time = perf_counter()
++        indexed_frame_ids = [key.frame_id for key in getattr(dataset, "_frame_keys", ())]
++        for index, frame_id in enumerate(indexed_frame_ids):
++            if frame_id < args.start_frame or (args.end_frame >= 0 and frame_id > args.end_frame):
++                continue
++            frame = dataset[index]
++            frame_start = perf_counter()
++            lidar_detections = pp.predict(frame)
++            camera_detections = yolo.predict(frame)
++            tracker.update(lidar_detections)
++            track_detections = _track_detections(tracker)
++            fusion_result = associate_camera_lidar_detections(
++                track_detections,
++                camera_detections,
++                calibration,
++                image_shape=frame.image.shape,
++                iou_threshold=float(fusion_settings.get("iou_threshold", 0.1)),
++                center_distance_threshold=float(fusion_settings.get("center_distance_threshold", 80.0)),
++                coordinate_frame="lidar",
++            )
++            fused_detections = _attach_track_ids(fusion_result, track_detections, tracker)
++            image = _draw_frame(frame, calibration, lidar_detections, camera_detections, track_detections, fused_detections)
++            height, width = image.shape[:2]
++            if height % 2 or width % 2:
++                image = cv2.copyMakeBorder(image, 0, height % 2, 0, width % 2, cv2.BORDER_CONSTANT, value=(0, 0, 0))
++            video_size = image.shape[1], image.shape[0]
++            if writer is None:
++                # mp4v requires even dimensions; pad only the video frame, never
++                # the geometric image coordinates used by projection/fusion.
++                writer = cv2.VideoWriter(str(output_video), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, video_size)
++                if not writer.isOpened():
++                    raise OSError(f"failed to open video writer: {output_video}")
++                writer_size = video_size
++            elif writer_size != video_size:
++                raise RuntimeError("video frame dimensions changed")
++            writer.write(image)
++            elapsed = perf_counter() - frame_start
++            timings.append(elapsed)
++            frame_count += 1
++            processed_frame_ids.append(frame_id)
++            total.update({"lidar_detections": len(lidar_detections), "camera_detections": len(camera_detections), "tracks": len(track_detections), "fused": len(fused_detections)})
++            if frame_count % 10 == 0 or frame_count == 1:
++                print(f"Processed {frame_count} frames; KITTI frame={frame_id:06d}; PP={len(lidar_detections)} YOLO={len(camera_detections)} tracks={len(track_detections)} fused={len(fused_detections)}")
++        if not frame_count:
++            raise ValueError("no frames selected")
++        wall_time = perf_counter() - start_time
++        payload = {
++            "status": "OK",
++            "sequence": str(args.sequence),
++            "frame_range": {"start": int(processed_frame_ids[0]), "end": int(processed_frame_ids[-1])},
++            "frames_processed": frame_count,
++            "detectors": {"lidar": "MMDetection3D PointPillars", "camera": "YOLO26 ONNX"},
++            "models": {
++                "lidar_config": str(_resolve(str(real["config"]))),
++                "lidar_checkpoint": str(_resolve(str(real["checkpoint"]))),
++                "camera_onnx": str(_resolve(str(camera["model"]))),
++            },
++            "thresholds": {
++                "lidar_score": float(real.get("score_threshold", 0.3)),
++                "camera_score": float(camera.get("score_threshold", 0.25)),
++                "camera_iou": float(camera.get("iou_threshold", 0.45)),
++            },
++            "class_mapping": {"Car": 1, "Pedestrian": 2, "Cyclist": 3},
++            "totals": dict(total),
++            "averages": {
++                "lidar_detections_per_frame": total["lidar_detections"] / frame_count,
++                "camera_detections_per_frame": total["camera_detections"] / frame_count,
++                "tracks_per_frame": total["tracks"] / frame_count,
++                "fused_per_frame": total["fused"] / frame_count,
++            },
++            "runtime": {
++                "wall_seconds": wall_time,
++                "end_to_end_fps": frame_count / wall_time,
++                "latency_ms_per_frame": float(np.mean(timings) * 1000.0),
++            },
++            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++            "config": {"dataset": str(args.dataset_config), "detector": str(args.detector_config), "tracker": str(args.tracker_config)},
++        }
++        output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++    except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++    finally:
++        if writer is not None:
++            writer.release()
++    print(f"Saved end-to-end video: {output_video}")
++    print(f"Saved end-to-end summary: {output_json}")
++    print(f"Frames: {frame_count}; average fused/frame: {total['fused'] / frame_count:.2f}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/train_yolo26_kitti.py b/scripts/train_yolo26_kitti.py
+new file mode 100644
+index 0000000..88e8fa5
+--- /dev/null
++++ b/scripts/train_yolo26_kitti.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""Fine-tune YOLO26s on KITTI Tracking Car/Pedestrian/Cyclist labels.
++
++Run this script in the temporary environment created from the main project:
++``/tmp/robot-perception-mot-yolo26/bin/python scripts/train_yolo26_kitti.py``.
++It writes the selected best checkpoint under ``weights/`` without modifying the
++``robot-perception-mot`` conda environment.
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++import shutil
++import sys
++from typing import Any
++
++import yaml
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
++
++def _resolve(value: str | Path) -> Path:
++    path = Path(value)
++    return path if path.is_absolute() else REPO_ROOT / path
++
++
++def _load(path: Path) -> dict[str, Any]:
++    value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++    if not isinstance(value, dict):
++        raise ValueError("YOLO26 training config must be a mapping")
++    return value
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", type=Path, default=REPO_ROOT / "configs" / "yolo26_train.yaml")
++    parser.add_argument("--epochs", type=int, help="Override configured epochs")
++    parser.add_argument("--device", help="Override configured CUDA device")
++    args = parser.parse_args(argv)
++    try:
++        from ultralytics import YOLO
++
++        config = _load(args.config)
++        model_path = _resolve(config["model"])
++        data_path = _resolve(config["data"])
++        if not model_path.is_file() or not data_path.is_file():
++            raise FileNotFoundError("YOLO26 model or data configuration is missing")
++        epochs = int(args.epochs if args.epochs is not None else config["epochs"])
++        if epochs < 1:
++            raise ValueError("epochs must be positive")
++        model = YOLO(str(model_path))
++        model.train(
++            data=str(data_path),
++            epochs=epochs,
++            imgsz=int(config["imgsz"]),
++            batch=int(config["batch"]),
++            device=str(args.device if args.device is not None else config["device"]),
++            workers=int(config["workers"]),
++            patience=int(config["patience"]),
++            seed=int(config["seed"]),
++            project=str(_resolve(config["project"])),
++            name=str(config["name"]),
++            exist_ok=True,
++            pretrained=True,
++            plots=True,
++        )
++        best_weight = Path(model.trainer.save_dir) / "weights" / "best.pt"
++        target = _resolve(config["output_weight"])
++        if not best_weight.is_file():
++            raise FileNotFoundError(f"YOLO26 training did not produce {best_weight}")
++        target.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(best_weight, target)
++    except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++    print(f"Saved KITTI three-class YOLO26 checkpoint: {target}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/robot_perception/fusion/yolo26.py b/src/robot_perception/fusion/yolo26.py
+new file mode 100644
+index 0000000..a0a4493
+--- /dev/null
++++ b/src/robot_perception/fusion/yolo26.py
+@@ -0,0 +1,124 @@
++"""OpenCV DNN adapter for a KITTI three-class YOLO26 ONNX camera detector."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++
++from robot_perception.common.types import FrameData
++from robot_perception.fusion.camera_lidar import BaseCameraDetector, Camera2DDetection
++
++
++class Yolo26OnnxCameraDetector(BaseCameraDetector):
++    """Run a fine-tuned YOLO26 ONNX model without adding runtime dependencies.
++
++    The exported YOLO26 graph returns rows in ``[x1, y1, x2, y2, score, cls]``
++    letterbox-input coordinates. ``class_mapping`` maps the three YOLO training
++    labels (Car/Pedestrian/Cyclist) to the project's stable class IDs.
++    """
++
++    def __init__(
++        self,
++        model_path: str | Path,
++        *,
++        score_threshold: float = 0.25,
++        iou_threshold: float = 0.45,
++        input_size: int = 640,
++        class_mapping: dict[int, int] | None = None,
++        net: Any | None = None,
++    ) -> None:
++        if not 0.0 <= score_threshold <= 1.0 or not np.isfinite(score_threshold):
++            raise ValueError("score_threshold must be finite and within [0, 1]")
++        if not 0.0 <= iou_threshold <= 1.0 or not np.isfinite(iou_threshold):
++            raise ValueError("iou_threshold must be finite and within [0, 1]")
++        if input_size < 32:
++            raise ValueError("input_size must be at least 32")
++        self.score_threshold = float(score_threshold)
++        self.iou_threshold = float(iou_threshold)
++        self.input_size = int(input_size)
++        self.class_mapping = dict({0: 1, 1: 2, 2: 3} if class_mapping is None else class_mapping)
++        if not self.class_mapping or any(int(key) < 0 or int(value) <= 0 for key, value in self.class_mapping.items()):
++            raise ValueError("class_mapping must map non-negative model IDs to positive project class IDs")
++        self.model_path = Path(model_path)
++        if net is None:
++            if not self.model_path.is_file():
++                raise FileNotFoundError(f"YOLO26 ONNX model not found: {self.model_path}")
++            try:
++                import cv2
++            except ImportError as error:
++                raise RuntimeError("OpenCV is required for YOLO26 ONNX inference") from error
++            net = cv2.dnn.readNetFromONNX(str(self.model_path))
++        self._net = net
++
++    def _letterbox(self, image: np.ndarray) -> tuple[np.ndarray, float, float, float]:
++        """Resize with centered padding and retain the reverse pixel transform."""
++
++        import cv2
++
++        height, width = image.shape[:2]
++        scale = min(self.input_size / width, self.input_size / height)
++        resized_width, resized_height = round(width * scale), round(height * scale)
++        resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
++        pad_x = (self.input_size - resized_width) / 2.0
++        pad_y = (self.input_size - resized_height) / 2.0
++        left, top = round(pad_x - 0.1), round(pad_y - 0.1)
++        right, bottom = round(pad_x + 0.1), round(pad_y + 0.1)
++        return cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114)), scale, float(left), float(top)
++
++    @staticmethod
++    def _rows(output: Any) -> np.ndarray:
++        """Normalize common YOLO26 ONNX output layouts to ``(N, 6)`` rows."""
++
++        array = np.asarray(output, dtype=np.float32)
++        if array.ndim == 3 and array.shape[0] == 1:
++            array = array[0]
++        if array.ndim != 2:
++            raise ValueError(f"YOLO26 ONNX output must be 2D after batch removal, got {array.shape}")
++        if array.shape[1] == 6:
++            rows = array
++        elif array.shape[0] == 6:
++            rows = array.T
++        else:
++            raise ValueError(f"YOLO26 ONNX output must have a 6-value dimension, got {array.shape}")
++        if not np.isfinite(rows).all():
++            raise ValueError("YOLO26 ONNX output contains NaN or Inf")
++        return rows
++
++    def predict(self, frame: FrameData) -> list[Camera2DDetection]:
++        """Infer KITTI Car/Pedestrian/Cyclist 2D boxes in original image pixels."""
++
++        if frame.image is None:
++            return []
++        image = np.asarray(frame.image)
++        if image.ndim != 3 or image.shape[2] != 3 or not np.isfinite(image).all():
++            raise ValueError("frame.image must be a finite BGR image with shape (H, W, 3)")
++        import cv2
++
++        letterboxed, scale, pad_x, pad_y = self._letterbox(image)
++        blob = cv2.dnn.blobFromImage(letterboxed, 1.0 / 255.0, (self.input_size, self.input_size), swapRB=True)
++        self._net.setInput(blob)
++        rows = self._rows(self._net.forward())
++        height, width = image.shape[:2]
++        candidates: dict[int, list[tuple[list[int], float, np.ndarray]]] = {}
++        for x1, y1, x2, y2, score, model_class in rows:
++            source_class = int(round(float(model_class)))
++            class_id = self.class_mapping.get(source_class)
++            if class_id is None or score < self.score_threshold:
++                continue
++            bbox = np.asarray(((x1 - pad_x) / scale, (y1 - pad_y) / scale, (x2 - pad_x) / scale, (y2 - pad_y) / scale))
++            bbox[[0, 2]] = np.clip(bbox[[0, 2]], 0.0, width - 1.0)
++            bbox[[1, 3]] = np.clip(bbox[[1, 3]], 0.0, height - 1.0)
++            if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
++                continue
++            xywh = [int(round(bbox[0])), int(round(bbox[1])), int(round(bbox[2] - bbox[0])), int(round(bbox[3] - bbox[1]))]
++            candidates.setdefault(class_id, []).append((xywh, float(score), bbox))
++
++        detections: list[Camera2DDetection] = []
++        for class_id, values in candidates.items():
++            kept = cv2.dnn.NMSBoxes([value[0] for value in values], [value[1] for value in values], self.score_threshold, self.iou_threshold)
++            for index in np.asarray(kept, dtype=np.int64).reshape(-1):
++                _, score, bbox = values[int(index)]
++                detections.append(Camera2DDetection(bbox, score, class_id))
++        return sorted(detections, key=lambda detection: (-detection.score, detection.class_id))
+diff --git a/tests/test_yolo26_camera.py b/tests/test_yolo26_camera.py
+new file mode 100644
+index 0000000..1aa2230
+--- /dev/null
++++ b/tests/test_yolo26_camera.py
+@@ -0,0 +1,47 @@
++"""Tests for the dependency-light YOLO26 ONNX camera detector adapter."""
++
++from __future__ import annotations
++
++import numpy as np
++
++from robot_perception.common.types import FrameData
++from robot_perception.fusion import Yolo26OnnxCameraDetector
++
++
++class _FakeNet:
++    def __init__(self, output: np.ndarray) -> None:
++        self.output = output
++        self.input_shape: tuple[int, ...] | None = None
++
++    def setInput(self, value: np.ndarray) -> None:
++        self.input_shape = value.shape
++
++    def forward(self) -> np.ndarray:
++        return self.output
++
++
++def _frame() -> FrameData:
++    return FrameData("0000", 0, np.zeros((100, 200, 3), dtype=np.uint8), np.empty((0, 4)), None)
++
++
++def test_yolo26_adapter_filters_to_kitti_classes_and_reverses_letterbox() -> None:
++    net = _FakeNet(np.asarray([[[160.0, 240.0, 480.0, 400.0, 0.9, 0.0], [0.0, 0.0, 20.0, 20.0, 0.95, 7.0]]]))
++    detector = Yolo26OnnxCameraDetector("unused.onnx", input_size=640, score_threshold=0.25, net=net)
++
++    detections = detector.predict(_frame())
++
++    assert net.input_shape == (1, 3, 640, 640)
++    assert len(detections) == 1
++    assert detections[0].class_id == 1
++    np.testing.assert_allclose(detections[0].bbox, (50.0, 25.0, 150.0, 75.0), atol=1.0)
++
++
++def test_yolo26_adapter_accepts_transposed_rows_and_empty_image() -> None:
++    net = _FakeNet(np.asarray([[[160.0], [240.0], [480.0], [400.0], [0.9], [2.0]]]))
++    detector = Yolo26OnnxCameraDetector("unused.onnx", input_size=640, net=net)
++
++    detections = detector.predict(_frame())
++
++    assert len(detections) == 1
++    assert detections[0].class_id == 3
++    assert detector.predict(FrameData("0000", 1, None, np.empty((0, 4)), None)) == []

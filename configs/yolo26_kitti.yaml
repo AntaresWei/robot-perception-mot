@@ -1,0 +1,8 @@
+# Ultralytics YOLO 数据集配置，由 scripts/prepare_kitti_yolo.py 生成目录后使用。
+path: data/yolo26_kitti_trainset
+train: images/train
+val: images/val
+names:
+  0: Car
+  1: Pedestrian
+  2: Cyclist
