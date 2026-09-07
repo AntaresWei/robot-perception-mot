@@ -48,6 +48,7 @@ def convert(
     output: Path,
     split: str = "training",
     sequences: list[str] | None = None,
+    val_sequences: list[str] | None = None,
 ) -> dict[str, int]:
     image_root, label_root = _paths(root, split)
     available_sequences = sorted(path.name for path in image_root.iterdir() if path.is_dir())
@@ -55,12 +56,19 @@ def convert(
     missing = sorted(set(selected_sequences) - set(available_sequences))
     if missing:
         raise FileNotFoundError(f"requested KITTI sequences are unavailable: {', '.join(missing)}")
-    train_sequences, val_sequences = _sequence_split(selected_sequences)
+    if val_sequences is None:
+        train_sequences, selected_val_sequences = _sequence_split(selected_sequences)
+    else:
+        selected_val_sequences = [f"{int(value):04d}" for value in val_sequences]
+        missing_val = sorted(set(selected_val_sequences) - set(selected_sequences))
+        if missing_val:
+            raise ValueError(f"validation sequences must be in selected sequences: {', '.join(missing_val)}")
+        train_sequences = [sequence for sequence in selected_sequences if sequence not in selected_val_sequences]
     if not selected_sequences:
         raise ValueError("no KITTI sequences found")
     for directory in (output / "images" / "train", output / "images" / "val", output / "labels" / "train", output / "labels" / "val"):
         directory.mkdir(parents=True, exist_ok=True)
-    counts = {"images": 0, "labels": 0, "boxes": 0, "train_sequences": len(train_sequences), "val_sequences": len(val_sequences)}
+    counts = {"images": 0, "labels": 0, "boxes": 0, "train_sequences": len(train_sequences), "val_sequences": len(selected_val_sequences)}
     for sequence_id in selected_sequences:
         subset = "train" if sequence_id in train_sequences else "val"
         label_path = label_root / f"{sequence_id}.txt"
@@ -112,9 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=REPO_ROOT / "data")
     parser.add_argument("--output", type=Path, default=REPO_ROOT / "data" / "yolo26_kitti")
     parser.add_argument("--sequences", nargs="+", help="Optional KITTI sequence IDs, for example 0000 0001")
+    parser.add_argument("--val-sequences", nargs="+", help="Validation sequence IDs kept out of training")
     args = parser.parse_args(argv)
     try:
-        print(convert(_resolve(args.root), _resolve(args.output), sequences=args.sequences))
+        print(convert(_resolve(args.root), _resolve(args.output), sequences=args.sequences, val_sequences=args.val_sequences))
     except (FileNotFoundError, OSError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2

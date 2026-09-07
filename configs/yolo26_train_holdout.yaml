@@ -1,0 +1,13 @@
+# 评估 0000 时使用：训练序列不包含 0000，避免 frame/sequence 泄漏。
+model: weights/yolo26s.pt
+data: configs/yolo26_kitti_holdout.yaml
+epochs: 10
+imgsz: 640
+batch: 16
+device: 0
+workers: 4
+patience: 10
+seed: 7
+project: outputs/training
+name: yolo26s_kitti3class_holdout0000
+output_weight: weights/yolo26s_kitti3class_holdout0000.pt

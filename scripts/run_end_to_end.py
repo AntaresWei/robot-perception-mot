@@ -178,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--device", help="PointPillars device, e.g. cuda:0")
     parser.add_argument("--min-hits", type=int, help="Override tracker confirmation hits for replay smoke/experiments")
+    parser.add_argument("--camera-model", type=Path, help="Override detector.camera.model (use hold-out ONNX for honest evaluation)")
     args = parser.parse_args(argv)
     writer = None
     writer_size: tuple[int, int] | None = None
@@ -203,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             class_mapping={int(key): int(value) for key, value in dict(real.get("class_mapping", {})).items()},
         )
         yolo = Yolo26OnnxCameraDetector(
-            _resolve(str(camera["model"])),
+            _resolve(args.camera_model or str(camera["model"])),
             score_threshold=float(camera.get("score_threshold", 0.25)),
             iou_threshold=float(camera.get("iou_threshold", 0.45)),
             input_size=int(camera.get("input_size", 640)),
@@ -288,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             "models": {
                 "lidar_config": str(_resolve(str(real["config"]))),
                 "lidar_checkpoint": str(_resolve(str(real["checkpoint"]))),
-                "camera_onnx": str(_resolve(str(camera["model"]))),
+                "camera_onnx": str(_resolve(args.camera_model or str(camera["model"]))),
             },
             "thresholds": {
                 "lidar_score": float(real.get("score_threshold", 0.3)),

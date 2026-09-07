@@ -1,0 +1,22 @@
+# 变更清单
+
+基线 `f6791cf672640602a3ca7185475d6e98727a1122` → 当前工作区 ｜ 8 个文件，+316 / -21
+
+```
+23	16	README.md
+12	3	scripts/prepare_kitti_yolo.py
+3	2	scripts/run_end_to_end.py
+8	0	configs/yolo26_kitti_holdout.yaml
+13	0	configs/yolo26_train_holdout.yaml
+197	0	scripts/evaluate_real_mot.py
+28	0	tests/test_prepare_yolo.py
+32	0	tests/test_real_evaluation.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- configs/yolo26_kitti_holdout.yaml
+- configs/yolo26_train_holdout.yaml
+- scripts/evaluate_real_mot.py
+- tests/test_prepare_yolo.py
+- tests/test_real_evaluation.py

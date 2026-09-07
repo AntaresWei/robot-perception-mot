@@ -1,0 +1,8 @@
+# 用于评估 sequence 0000 的严格 hold-out 数据配置；0000 不参与训练。
+path: data/yolo26_kitti_holdout
+train: images/train
+val: images/val
+names:
+  0: Car
+  1: Pedestrian
+  2: Cyclist

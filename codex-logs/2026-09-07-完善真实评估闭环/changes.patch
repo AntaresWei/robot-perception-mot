@@ -1,0 +1,462 @@
+diff --git a/README.md b/README.md
+index 14d13d8..f5e83e3 100644
+--- a/README.md
++++ b/README.md
+@@ -307,6 +307,12 @@ python scripts/prepare_kitti_yolo.py --output data/yolo26_kitti_trainset
+ `Cyclist`。本次 10 epoch 实际验证结果为 Precision `0.62777`、Recall `0.53965`、
+ mAP50 `0.53000`、mAP50-95 `0.32233`；这是 2D detector 验证结果，不等同于 MOT 指标。
+ 
++另外提供严格 hold-out 配置 `configs/yolo26_kitti_holdout.yaml`：sequence `0000` 的
++154 帧完全不进入训练，只用于验证。当前 hold-out 训练已完成 10 epochs，验证结果
++为 Precision `0.55334`、Recall `0.50818`、mAP50 `0.43773`、mAP50-95 `0.30819`；
++该权重和 ONNX 位于 `weights/yolo26s_kitti3class_holdout0000.*`，可用
++`scripts/run_end_to_end.py --camera-model ...holdout0000.onnx` 做无训练序列泄漏的 replay smoke。
++
+ ## 12. Kalman Filter
+ 
+ `ConstantVelocityKalmanFilter` 独立实现下列线性模型，不依赖 filterpy 的核心数学：
+@@ -414,21 +420,6 @@ CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python
+ LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
+ 但没有偷偷插入真实 PointPillars 推理链。
+ 
+-### 真实端到端 replay
+-
+-在 `mmdet3d-kitti` 环境中运行统一脚本，PointPillars 生成 LiDAR 3D box，YOLO26 ONNX
+-生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
+-
+-```bash
+-CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+-  scripts/run_end_to_end.py --sequence 0000 --device cuda:0
+-```
+-
+-输出 `outputs/videos/end_to_end_0000.mp4` 和 `outputs/metrics/end_to_end_0000.json`。
+-最近一次真实运行处理 154 帧：PointPillars 输出 1,594 个 3D detections，YOLO26 输出
+-727 个 2D detections，确认轨迹 1,214 个，融合结果 482 个；端到端耗时 34.13 秒，
+-约 4.51 FPS（包含两侧 detector、Tracker、projection、fusion 和视频写入）。
+-
+ ## 17. Benchmark
+ 
+ 运行：
+@@ -451,6 +442,17 @@ python scripts/evaluate.py --config configs/pipeline.yaml --sequence 0000
+ 完整配置、sequence、帧范围、timestamp、MOTA、IDF1、IDS、FP、FN、CPU peak RSS、
+ FPS 与 latency；GT input 的 GPU memory 明确写为 `NOT RUN`。
+ 
++真实 PointPillars 驱动的 MOT 评估使用：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/evaluate_real_mot.py --sequence 0000 --device cuda:0
++```
++
++该脚本将 KITTI camera GT box center 通过 calibration 转到 LiDAR 坐标，再与真实
++PointPillars -> Tracker 输出匹配；结果写入 `outputs/metrics/real_pointpillars_mot.json`。
++这和 GTDetector benchmark 是两个不同实验。
++
+ ## 18. Results
+ 
+ 下表直接整理自当前 `outputs/metrics/*.json`。实验配置为 KITTI Tracking `0000`、
+@@ -467,6 +469,11 @@ GT detection input。最近一次运行的 CPU peak RSS 为 `62.94 MB`，GPU mem
+ 因此三种方法在此输入上都达到 1.0。它们只证明 benchmark、association 和 tracking
+ 链路可复现，**不能**用于比较真实 Detector、PointPillars 或端到端系统的性能。
+ 
++真实 PointPillars `0000` 全序列评估结果为：GT `711`、matches `448`、FP `766`、
++FN `263`、IDS `8`、MOTA `-0.4585`、IDF1 `0.4655`、FPS `25.10`。负 MOTA 表示
++当前预训练 detector 的误检/漏检数量已经超过 GT 数量；它是实际 detector-driven
++结果，不应被隐藏或替换成 GT benchmark 的 1.0。
++
+ ![MOT baseline comparison](outputs/metrics/mot_comparison.png)
+ 
+ ## 19. Visualization
+@@ -497,7 +504,7 @@ python scripts/render_fusion_video.py --sequence 0000
+ 
+ - MOT benchmark 的三个 baseline 仍使用 GT/NoisyGT 输入；它们验证 tracking/association，
+   不代表真实 detector 性能。PointPillars + YOLO26 全序列 replay 已可运行，但尚未计算
+-  标准 detector mAP/recall 或真实 detector 驱动的 MOT ground-truth 评估。
++  标准 detector mAP/recall；真实 PointPillars 驱动的 MOT 指标已记录，但当前结果较弱。
+ - `SyntheticCameraDetector` 是实验 mock，Camera-LiDAR fusion 目前是几何投影、
+   跨模态匹配与规则置信度，不是 neural fusion。
+ - 当前 IDF1 为基于逐帧位置匹配的可复现 baseline，不替代 MOTChallenge 全局 ID 指标。
+diff --git a/scripts/prepare_kitti_yolo.py b/scripts/prepare_kitti_yolo.py
+index e1bd02f..18a7d2b 100644
+--- a/scripts/prepare_kitti_yolo.py
++++ b/scripts/prepare_kitti_yolo.py
+@@ -48,6 +48,7 @@ def convert(
+     output: Path,
+     split: str = "training",
+     sequences: list[str] | None = None,
++    val_sequences: list[str] | None = None,
+ ) -> dict[str, int]:
+     image_root, label_root = _paths(root, split)
+     available_sequences = sorted(path.name for path in image_root.iterdir() if path.is_dir())
+@@ -55,12 +56,19 @@ def convert(
+     missing = sorted(set(selected_sequences) - set(available_sequences))
+     if missing:
+         raise FileNotFoundError(f"requested KITTI sequences are unavailable: {', '.join(missing)}")
+-    train_sequences, val_sequences = _sequence_split(selected_sequences)
++    if val_sequences is None:
++        train_sequences, selected_val_sequences = _sequence_split(selected_sequences)
++    else:
++        selected_val_sequences = [f"{int(value):04d}" for value in val_sequences]
++        missing_val = sorted(set(selected_val_sequences) - set(selected_sequences))
++        if missing_val:
++            raise ValueError(f"validation sequences must be in selected sequences: {', '.join(missing_val)}")
++        train_sequences = [sequence for sequence in selected_sequences if sequence not in selected_val_sequences]
+     if not selected_sequences:
+         raise ValueError("no KITTI sequences found")
+     for directory in (output / "images" / "train", output / "images" / "val", output / "labels" / "train", output / "labels" / "val"):
+         directory.mkdir(parents=True, exist_ok=True)
+-    counts = {"images": 0, "labels": 0, "boxes": 0, "train_sequences": len(train_sequences), "val_sequences": len(val_sequences)}
++    counts = {"images": 0, "labels": 0, "boxes": 0, "train_sequences": len(train_sequences), "val_sequences": len(selected_val_sequences)}
+     for sequence_id in selected_sequences:
+         subset = "train" if sequence_id in train_sequences else "val"
+         label_path = label_root / f"{sequence_id}.txt"
+@@ -112,9 +120,10 @@ def main(argv: list[str] | None = None) -> int:
+     parser.add_argument("--root", type=Path, default=REPO_ROOT / "data")
+     parser.add_argument("--output", type=Path, default=REPO_ROOT / "data" / "yolo26_kitti")
+     parser.add_argument("--sequences", nargs="+", help="Optional KITTI sequence IDs, for example 0000 0001")
++    parser.add_argument("--val-sequences", nargs="+", help="Validation sequence IDs kept out of training")
+     args = parser.parse_args(argv)
+     try:
+-        print(convert(_resolve(args.root), _resolve(args.output), sequences=args.sequences))
++        print(convert(_resolve(args.root), _resolve(args.output), sequences=args.sequences, val_sequences=args.val_sequences))
+     except (FileNotFoundError, OSError, ValueError) as error:
+         print(f"Error: {error}", file=sys.stderr)
+         return 2
+diff --git a/scripts/run_end_to_end.py b/scripts/run_end_to_end.py
+index 7da7c8f..371422a 100644
+--- a/scripts/run_end_to_end.py
++++ b/scripts/run_end_to_end.py
+@@ -178,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
+     parser.add_argument("--output-json", type=Path)
+     parser.add_argument("--device", help="PointPillars device, e.g. cuda:0")
+     parser.add_argument("--min-hits", type=int, help="Override tracker confirmation hits for replay smoke/experiments")
++    parser.add_argument("--camera-model", type=Path, help="Override detector.camera.model (use hold-out ONNX for honest evaluation)")
+     args = parser.parse_args(argv)
+     writer = None
+     writer_size: tuple[int, int] | None = None
+@@ -203,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
+             class_mapping={int(key): int(value) for key, value in dict(real.get("class_mapping", {})).items()},
+         )
+         yolo = Yolo26OnnxCameraDetector(
+-            _resolve(str(camera["model"])),
++            _resolve(args.camera_model or str(camera["model"])),
+             score_threshold=float(camera.get("score_threshold", 0.25)),
+             iou_threshold=float(camera.get("iou_threshold", 0.45)),
+             input_size=int(camera.get("input_size", 640)),
+@@ -288,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
+             "models": {
+                 "lidar_config": str(_resolve(str(real["config"]))),
+                 "lidar_checkpoint": str(_resolve(str(real["checkpoint"]))),
+-                "camera_onnx": str(_resolve(str(camera["model"]))),
++                "camera_onnx": str(_resolve(args.camera_model or str(camera["model"]))),
+             },
+             "thresholds": {
+                 "lidar_score": float(real.get("score_threshold", 0.3)),
+diff --git a/configs/yolo26_kitti_holdout.yaml b/configs/yolo26_kitti_holdout.yaml
+new file mode 100644
+index 0000000..443a27c
+--- /dev/null
++++ b/configs/yolo26_kitti_holdout.yaml
+@@ -0,0 +1,8 @@
++# 用于评估 sequence 0000 的严格 hold-out 数据配置；0000 不参与训练。
++path: data/yolo26_kitti_holdout
++train: images/train
++val: images/val
++names:
++  0: Car
++  1: Pedestrian
++  2: Cyclist
+diff --git a/configs/yolo26_train_holdout.yaml b/configs/yolo26_train_holdout.yaml
+new file mode 100644
+index 0000000..4f9b843
+--- /dev/null
++++ b/configs/yolo26_train_holdout.yaml
+@@ -0,0 +1,13 @@
++# 评估 0000 时使用：训练序列不包含 0000，避免 frame/sequence 泄漏。
++model: weights/yolo26s.pt
++data: configs/yolo26_kitti_holdout.yaml
++epochs: 10
++imgsz: 640
++batch: 16
++device: 0
++workers: 4
++patience: 10
++seed: 7
++project: outputs/training
++name: yolo26s_kitti3class_holdout0000
++output_weight: weights/yolo26s_kitti3class_holdout0000.pt
+diff --git a/scripts/evaluate_real_mot.py b/scripts/evaluate_real_mot.py
+new file mode 100644
+index 0000000..5fe8dd4
+--- /dev/null
++++ b/scripts/evaluate_real_mot.py
+@@ -0,0 +1,197 @@
++#!/usr/bin/env python3
++"""Evaluate real PointPillars -> Tracker MOT metrics on KITTI Tracking.
++
++Run in the ``mmdet3d-kitti`` environment. KITTI labels are stored in rectified
++camera coordinates; this script converts their bottom-center boxes to LiDAR
++centers before matching against PointPillars detections and TrackState output.
++"""
++
++from __future__ import annotations
++
++import argparse
++from datetime import datetime, timezone
++import json
++from pathlib import Path
++import sys
++from time import perf_counter
++
++import numpy as np
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++SRC_DIR = REPO_ROOT / "src"
++if str(SRC_DIR) not in sys.path:
++    sys.path.insert(0, str(SRC_DIR))
++
++from robot_perception.common.types import Detection3D, FrameData  # noqa: E402
++from robot_perception.dataset import KittiTrackingDataset  # noqa: E402
++from robot_perception.dataset.calibration import parse_kitti_calibration  # noqa: E402
++from robot_perception.detection import MMDet3DPointPillarsAdapter  # noqa: E402
++from robot_perception.detection.base import KITTI_CLASS_IDS  # noqa: E402
++from robot_perception.tracking import MultiObjectTracker  # noqa: E402
++from robot_perception.tracking.association import hungarian_association  # noqa: E402
++
++
++def _load_yaml(path: Path) -> dict[str, object]:
++    import yaml
++
++    value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++    if not isinstance(value, dict):
++        raise ValueError(f"configuration root must be a mapping: {path}")
++    return value
++
++
++def _resolve(path_value: str | Path) -> Path:
++    path = Path(path_value)
++    return path if path.is_absolute() else REPO_ROOT / path
++
++
++def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
++    for candidate in (
++        root / split / "calib" / f"{sequence_id}.txt",
++        root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
++    ):
++        if candidate.is_file():
++            return candidate
++    raise FileNotFoundError(f"calibration not found for sequence {sequence_id}")
++
++
++def _camera_annotation_to_lidar(annotation: object, calibration: object) -> np.ndarray | None:
++    class_id = KITTI_CLASS_IDS.get(annotation.class_name)
++    if class_id is None or class_id > 3:
++        return None
++    # KITTI location is bottom-center in rectified camera coordinates. Convert
++    # the 3D box center to unrectified camera, then solve Tr_velo_to_cam.
++    camera_rect = np.asarray(annotation.location, dtype=np.float64).copy()
++    camera_rect[1] -= float(annotation.dimensions[2]) / 2.0
++    rect = np.asarray(calibration.R0_rect, dtype=np.float64)
++    camera = np.linalg.solve(rect, camera_rect)
++    transform = np.asarray(calibration.Tr_velo_to_cam, dtype=np.float64)
++    rotation, translation = transform[:, :3], transform[:, 3]
++    return np.linalg.solve(rotation, camera - translation)
++
++
++def _truth_frame(frame: FrameData, calibration: object) -> list[tuple[int, int, np.ndarray]]:
++    truth: list[tuple[int, int, np.ndarray]] = []
++    for annotation in frame.annotations or []:
++        position = _camera_annotation_to_lidar(annotation, calibration)
++        class_id = KITTI_CLASS_IDS.get(annotation.class_name)
++        if position is not None and class_id is not None and np.isfinite(position).all():
++            truth.append((int(annotation.track_id), int(class_id), position))
++    return truth
++
++
++def _match_frame(
++    truth: list[tuple[int, int, np.ndarray]],
++    predictions: list[tuple[int, int, np.ndarray]],
++    threshold: float,
++) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    if not truth or not predictions:
++        return np.empty((0, 2), dtype=np.int64), np.arange(len(truth)), np.arange(len(predictions))
++    costs = np.full((len(truth), len(predictions)), np.inf, dtype=np.float64)
++    for ti, (_, truth_class, truth_position) in enumerate(truth):
++        for pi, (_, prediction_class, prediction_position) in enumerate(predictions):
++            if truth_class == prediction_class:
++                costs[ti, pi] = np.linalg.norm(truth_position - prediction_position)
++    result = hungarian_association(costs, valid_mask=np.isfinite(costs) & (costs <= threshold))
++    return result.matches, result.unmatched_tracks, result.unmatched_detections
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--sequence", required=True)
++    parser.add_argument("--start-frame", type=int, default=0)
++    parser.add_argument("--end-frame", type=int, default=-1)
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--distance-threshold", type=float, default=2.0)
++    parser.add_argument("--output", type=Path, default=REPO_ROOT / "outputs" / "metrics" / "real_pointpillars_mot.json")
++    args = parser.parse_args(argv)
++    try:
++        dataset_config = _load_yaml(REPO_ROOT / "configs" / "dataset.yaml").get("dataset")
++        detector_config = _load_yaml(REPO_ROOT / "configs" / "detector.yaml").get("detector")
++        tracker_config = _load_yaml(REPO_ROOT / "configs" / "tracker.yaml").get("tracker")
++        if not isinstance(dataset_config, dict) or not isinstance(detector_config, dict) or not isinstance(tracker_config, dict):
++            raise ValueError("dataset, detector, and tracker config sections are required")
++        root = _resolve(str(dataset_config.get("root", "data")))
++        split = str(dataset_config.get("split", "training"))
++        dataset = KittiTrackingDataset(root, split=split, sequences=[args.sequence], load_images=False, load_annotations=True)
++        calibration = parse_kitti_calibration(_calibration_path(root, split, args.sequence))
++        real = detector_config.get("real")
++        if not isinstance(real, dict):
++            raise ValueError("detector.real is required")
++        detector = MMDet3DPointPillarsAdapter(
++            _resolve(str(real["config"])),
++            _resolve(str(real["checkpoint"])),
++            device=args.device,
++            score_threshold=float(real.get("score_threshold", 0.3)),
++            class_mapping={int(key): int(value) for key, value in dict(real.get("class_mapping", {})).items()},
++        )
++        tracker = MultiObjectTracker(
++            min_hits=int(tracker_config.get("min_hits", 3)),
++            max_age=int(tracker_config.get("max_age", 5)),
++            gating_threshold=float(tracker_config.get("gating_threshold", 9.21)),
++            initial_covariance=tracker_config.get("initial_covariance", 1.0),
++            process_noise=tracker_config.get("process_noise", 0.01),
++            measurement_noise=tracker_config.get("measurement_noise", 0.1),
++        )
++        total_gt = total_fp = total_fn = total_ids = idtp = 0
++        previous_ids: dict[int, int] = {}
++        frame_count = 0
++        start_time = perf_counter()
++        frame_keys = getattr(dataset, "_frame_keys", ())
++        for index, key in enumerate(frame_keys):
++            if key.frame_id < args.start_frame or (args.end_frame >= 0 and key.frame_id > args.end_frame):
++                continue
++            frame = dataset[index]
++            detections = detector.predict(frame)
++            tracker.update(detections)
++            predictions = [
++                (track.track_id, track.class_id, track.state[:3].copy())
++                for track in tracker.tracks
++                if track.status == "Confirmed" and track.time_since_update == 0
++            ]
++            truth = _truth_frame(frame, calibration)
++            matches, unmatched_truth, unmatched_predictions = _match_frame(truth, predictions, args.distance_threshold)
++            total_gt += len(truth)
++            total_fn += len(unmatched_truth)
++            total_fp += len(unmatched_predictions)
++            idtp += len(matches)
++            for truth_index, prediction_index in matches:
++                gt_id = truth[int(truth_index)][0]
++                track_id = predictions[int(prediction_index)][0]
++                if gt_id in previous_ids and previous_ids[gt_id] != track_id:
++                    total_ids += 1
++                previous_ids[gt_id] = track_id
++            frame_count += 1
++            if frame_count % 10 == 0 or frame_count == 1:
++                print(f"Processed {frame_count} frames; frame={key.frame_id:06d}; detector={len(detections)} tracks={len(predictions)}")
++        elapsed = perf_counter() - start_time
++        idf1_denominator = 2 * idtp + total_fp + total_fn
++        metrics = {
++            "status": "OK",
++            "detector": "MMDetection3D PointPillars",
++            "sequence": str(args.sequence),
++            "frame_range": {"start": args.start_frame, "end": args.end_frame},
++            "frames": frame_count,
++            "GT": total_gt,
++            "matches": idtp,
++            "FP": total_fp,
++            "FN": total_fn,
++            "IDS": total_ids,
++            "MOTA": 1.0 - (total_fn + total_fp + total_ids) / max(total_gt, 1),
++            "IDF1": 2 * idtp / idf1_denominator if idf1_denominator else 0.0,
++            "runtime_seconds": elapsed,
++            "FPS": frame_count / elapsed if elapsed else 0.0,
++            "distance_threshold_m": args.distance_threshold,
++            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++        }
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++    except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError) as error:
++        print(f"Error: {error}", file=sys.stderr)
++        return 2
++    print(json.dumps(metrics, ensure_ascii=False, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_prepare_yolo.py b/tests/test_prepare_yolo.py
+new file mode 100644
+index 0000000..a96251a
+--- /dev/null
++++ b/tests/test_prepare_yolo.py
+@@ -0,0 +1,28 @@
++"""Tests for KITTI-to-YOLO label conversion boundaries."""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++import sys
++
++ROOT = Path(__file__).resolve().parents[1]
++SPEC = importlib.util.spec_from_file_location("prepare_yolo", ROOT / "scripts" / "prepare_kitti_yolo.py")
++assert SPEC is not None and SPEC.loader is not None
++module = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = module
++SPEC.loader.exec_module(module)
++
++
++def test_explicit_validation_sequences_do_not_overlap_training() -> None:
++    train, validation = module._sequence_split(["0000", "0001", "0002", "0003"])
++
++    assert set(train).isdisjoint(validation)
++    assert set(train) | set(validation) == {"0000", "0001", "0002", "0003"}
++
++
++def test_kitti_class_mapping_is_limited_to_three_project_classes() -> None:
++    assert module.CLASS_IDS["Car"] == module.CLASS_IDS["Van"] == module.CLASS_IDS["Truck"] == 0
++    assert module.CLASS_IDS["Pedestrian"] == 1
++    assert module.CLASS_IDS["Cyclist"] == 2
++    assert "DontCare" not in module.CLASS_IDS
+diff --git a/tests/test_real_evaluation.py b/tests/test_real_evaluation.py
+new file mode 100644
+index 0000000..e949bc1
+--- /dev/null
++++ b/tests/test_real_evaluation.py
+@@ -0,0 +1,32 @@
++"""Unit tests for real-evaluation geometry helpers."""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++import sys
++
++import numpy as np
++
++from robot_perception.common.types import KittiTrackingAnnotation
++from robot_perception.dataset.calibration import KittiCalibration
++
++ROOT = Path(__file__).resolve().parents[1]
++SPEC = importlib.util.spec_from_file_location("real_eval", ROOT / "scripts" / "evaluate_real_mot.py")
++assert SPEC is not None and SPEC.loader is not None
++module = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = module
++SPEC.loader.exec_module(module)
++
++
++def test_camera_annotation_is_converted_to_lidar_center() -> None:
++    annotation = KittiTrackingAnnotation(
++        frame_id=0, track_id=3, class_name="Car", truncation=0.0, occlusion=0,
++        alpha=0.0, bbox_2d=np.ones(4), dimensions=np.asarray((4.0, 2.0, 2.0)),
++        location=np.asarray((1.0, 2.0, 10.0)), yaw=0.0,
++    )
++    calibration = KittiCalibration(P2=np.hstack((np.eye(3), np.zeros((3, 1)))), R0_rect=np.eye(3), Tr_velo_to_cam=np.hstack((np.eye(3), np.asarray([[1.0], [0.0], [0.0]]))))
++
++    result = module._camera_annotation_to_lidar(annotation, calibration)
++
++    np.testing.assert_allclose(result, (0.0, 1.0, 10.0))

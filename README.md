@@ -147,6 +147,8 @@ data/training/{image_02,velodyne,calib,label_02}/
 
 激活 `robot-perception-mot` 后，在仓库根目录依次运行：
 
+面向初学者的完整中文教程见：[中文项目教程](docs/project_tutorial_zh.md)。
+
 ```bash
 # 读取一帧并检查图像、点云和标签
 python scripts/inspect_kitti.py --sequence 0000 --frame 100
@@ -307,6 +309,12 @@ python scripts/prepare_kitti_yolo.py --output data/yolo26_kitti_trainset
 `Cyclist`。本次 10 epoch 实际验证结果为 Precision `0.62777`、Recall `0.53965`、
 mAP50 `0.53000`、mAP50-95 `0.32233`；这是 2D detector 验证结果，不等同于 MOT 指标。
 
+另外提供严格 hold-out 配置 `configs/yolo26_kitti_holdout.yaml`：sequence `0000` 的
+154 帧完全不进入训练，只用于验证。当前 hold-out 训练已完成 10 epochs，验证结果
+为 Precision `0.55334`、Recall `0.50818`、mAP50 `0.43773`、mAP50-95 `0.30819`；
+该权重和 ONNX 位于 `weights/yolo26s_kitti3class_holdout0000.*`，可用
+`scripts/run_end_to_end.py --camera-model ...holdout0000.onnx` 做无训练序列泄漏的 replay smoke。
+
 ## 12. Kalman Filter
 
 `ConstantVelocityKalmanFilter` 独立实现下列线性模型，不依赖 filterpy 的核心数学：
@@ -414,21 +422,6 @@ CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python 
 LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
 但没有偷偷插入真实 PointPillars 推理链。
 
-### 真实端到端 replay
-
-在 `mmdet3d-kitti` 环境中运行统一脚本，PointPillars 生成 LiDAR 3D box，YOLO26 ONNX
-生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
-  scripts/run_end_to_end.py --sequence 0000 --device cuda:0
-```
-
-输出 `outputs/videos/end_to_end_0000.mp4` 和 `outputs/metrics/end_to_end_0000.json`。
-最近一次真实运行处理 154 帧：PointPillars 输出 1,594 个 3D detections，YOLO26 输出
-727 个 2D detections，确认轨迹 1,214 个，融合结果 482 个；端到端耗时 34.13 秒，
-约 4.51 FPS（包含两侧 detector、Tracker、projection、fusion 和视频写入）。
-
 ## 17. Benchmark
 
 运行：
@@ -451,6 +444,17 @@ python scripts/evaluate.py --config configs/pipeline.yaml --sequence 0000
 完整配置、sequence、帧范围、timestamp、MOTA、IDF1、IDS、FP、FN、CPU peak RSS、
 FPS 与 latency；GT input 的 GPU memory 明确写为 `NOT RUN`。
 
+真实 PointPillars 驱动的 MOT 评估使用：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+  scripts/evaluate_real_mot.py --sequence 0000 --device cuda:0
+```
+
+该脚本将 KITTI camera GT box center 通过 calibration 转到 LiDAR 坐标，再与真实
+PointPillars -> Tracker 输出匹配；结果写入 `outputs/metrics/real_pointpillars_mot.json`。
+这和 GTDetector benchmark 是两个不同实验。
+
 ## 18. Results
 
 下表直接整理自当前 `outputs/metrics/*.json`。实验配置为 KITTI Tracking `0000`、
@@ -466,6 +470,11 @@ GT detection input。最近一次运行的 CPU peak RSS 为 `62.94 MB`，GPU mem
 这些数值是 **GT-based tracking validation**：GT detector 没有漏检或定位噪声，
 因此三种方法在此输入上都达到 1.0。它们只证明 benchmark、association 和 tracking
 链路可复现，**不能**用于比较真实 Detector、PointPillars 或端到端系统的性能。
+
+真实 PointPillars `0000` 全序列评估结果为：GT `711`、matches `448`、FP `766`、
+FN `263`、IDS `8`、MOTA `-0.4585`、IDF1 `0.4655`、FPS `25.10`。负 MOTA 表示
+当前预训练 detector 的误检/漏检数量已经超过 GT 数量；它是实际 detector-driven
+结果，不应被隐藏或替换成 GT benchmark 的 1.0。
 
 ![MOT baseline comparison](outputs/metrics/mot_comparison.png)
 
@@ -497,7 +506,7 @@ python scripts/render_fusion_video.py --sequence 0000
 
 - MOT benchmark 的三个 baseline 仍使用 GT/NoisyGT 输入；它们验证 tracking/association，
   不代表真实 detector 性能。PointPillars + YOLO26 全序列 replay 已可运行，但尚未计算
-  标准 detector mAP/recall 或真实 detector 驱动的 MOT ground-truth 评估。
+  标准 detector mAP/recall；真实 PointPillars 驱动的 MOT 指标已记录，但当前结果较弱。
 - `SyntheticCameraDetector` 是实验 mock，Camera-LiDAR fusion 目前是几何投影、
   跨模态匹配与规则置信度，不是 neural fusion。
 - 当前 IDF1 为基于逐帧位置匹配的可复现 baseline，不替代 MOTChallenge 全局 ID 指标。
