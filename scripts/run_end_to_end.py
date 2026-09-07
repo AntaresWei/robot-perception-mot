@@ -35,6 +35,7 @@ from robot_perception.fusion import (  # noqa: E402
     associate_camera_lidar_detections,
     project_detection_to_image,
 )
+from robot_perception.reid import AppearanceGallery, FastReIDEncoder, ReIDIdentityManager  # noqa: E402
 from robot_perception.tracking import MultiObjectTracker  # noqa: E402
 
 
@@ -90,6 +91,7 @@ def _attach_track_ids(
     fusion_result: object,
     track_detections: list[Detection3D],
     tracker: MultiObjectTracker,
+    public_id_by_internal: dict[int, int] | None = None,
 ) -> tuple[FusedDetection, ...]:
     """Restore Track IDs after fusion association without changing fusion core code."""
 
@@ -102,7 +104,8 @@ def _attach_track_ids(
             fused.append(item)
             continue
         distances = [float(np.linalg.norm(track.state[:3] - item.lidar_detection.position)) for track in confirmed_tracks]
-        track_id = confirmed_tracks[int(np.argmin(distances))].track_id
+        internal_track_id = confirmed_tracks[int(np.argmin(distances))].track_id
+        track_id = int((public_id_by_internal or {}).get(internal_track_id, internal_track_id))
         camera_detection = Camera2DDetection(
             bbox=item.camera_detection.bbox,
             score=item.camera_detection.score,
@@ -179,6 +182,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", help="PointPillars device, e.g. cuda:0")
     parser.add_argument("--min-hits", type=int, help="Override tracker confirmation hits for replay smoke/experiments")
     parser.add_argument("--camera-model", type=Path, help="Override detector.camera.model (use hold-out ONNX for honest evaluation)")
+    parser.add_argument("--enable-reid", action="store_true", help="Enable optional FastReID appearance gallery")
+    parser.add_argument("--reid-config", type=Path, default=REPO_ROOT / "configs" / "reid.yaml")
+    parser.add_argument("--fastreid-root", type=Path, help="FastReID source checkout, e.g. /tmp/fast-reid")
     args = parser.parse_args(argv)
     writer = None
     writer_size: tuple[int, int] | None = None
@@ -222,6 +228,29 @@ def main(argv: list[str] | None = None) -> int:
         fusion_settings = fusion_config.get("fusion", {})
         if not isinstance(fusion_settings, dict):
             raise ValueError("fusion config must contain a fusion mapping")
+        reid_settings = _load_yaml(args.reid_config).get("reid", {})
+        if not isinstance(reid_settings, dict):
+            raise ValueError("reid config must contain a reid mapping")
+        reid_enabled = bool(args.enable_reid or reid_settings.get("enabled", False))
+        reid_manager: ReIDIdentityManager | None = None
+        if reid_enabled:
+            fastreid_root = args.fastreid_root or reid_settings.get("fastreid_root")
+            reid_encoder = FastReIDEncoder(
+                _resolve(str(reid_settings["config"])),
+                _resolve(str(reid_settings["weights"])),
+                fastreid_root=None if fastreid_root is None else _resolve(str(fastreid_root)),
+                device=str(reid_settings.get("device", "cuda:0")),
+            )
+            reid_manager = ReIDIdentityManager(
+                reid_encoder,
+                gallery=AppearanceGallery(
+                    momentum=float(reid_settings.get("gallery_momentum", 0.9)),
+                    max_age_frames=int(reid_settings.get("gallery_max_age_frames", 300)),
+                ),
+                similarity_threshold=float(reid_settings.get("similarity_threshold", 0.75)),
+                min_gap_frames=int(reid_settings.get("min_gap_frames", 10)),
+                min_fusion_confidence=float(reid_settings.get("min_fusion_confidence", 0.5)),
+            )
         output_video = args.output_video or REPO_ROOT / "outputs" / "videos" / f"end_to_end_{args.sequence}.mp4"
         output_json = args.output_json or REPO_ROOT / "outputs" / "metrics" / f"end_to_end_{args.sequence}.json"
         output_video = _resolve(output_video)
@@ -234,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         frame_count = 0
         processed_frame_ids: list[int] = []
         timings: list[float] = []
+        reactivations = 0
         start_time = perf_counter()
         indexed_frame_ids = [key.frame_id for key in getattr(dataset, "_frame_keys", ())]
         for index, frame_id in enumerate(indexed_frame_ids):
@@ -254,7 +284,38 @@ def main(argv: list[str] | None = None) -> int:
                 center_distance_threshold=float(fusion_settings.get("center_distance_threshold", 80.0)),
                 coordinate_frame="lidar",
             )
-            fused_detections = _attach_track_ids(fusion_result, track_detections, tracker)
+            public_ids = {
+                track.track_id: (reid_manager.public_id(track.track_id) if reid_manager else track.track_id)
+                for track in tracker.tracks
+            }
+            if reid_manager is not None:
+                confirmed_tracks = [
+                    track for track in tracker.tracks if track.status == "Confirmed" and track.time_since_update == 0
+                ]
+                active_public_ids = set(public_ids.values())
+                for item in fusion_result.fused_detections:
+                    if not confirmed_tracks:
+                        continue
+                    nearest = min(
+                        confirmed_tracks,
+                        key=lambda track: float(np.linalg.norm(track.state[:3] - item.lidar_detection.position)),
+                    )
+                    decision = reid_manager.resolve(
+                        internal_track_id=nearest.track_id,
+                        class_id=item.camera_detection.class_id,
+                        frame_id=frame.frame_id,
+                        frame=frame,
+                        bbox=item.camera_detection.bbox,
+                        fusion_confidence=item.fusion_confidence,
+                        active_public_ids=active_public_ids - {public_ids.get(nearest.track_id, nearest.track_id)},
+                        detection_score=item.camera_detection.score,
+                    )
+                    public_ids[nearest.track_id] = decision.public_track_id
+                    active_public_ids.add(decision.public_track_id)
+                    if decision.reactivated:
+                        reactivations += 1
+                reid_manager.remove_deleted({track.track_id for track in tracker.tracks})
+            fused_detections = _attach_track_ids(fusion_result, track_detections, tracker, public_ids)
             image = _draw_frame(frame, calibration, lidar_detections, camera_detections, track_detections, fused_detections)
             height, width = image.shape[:2]
             if height % 2 or width % 2:
@@ -286,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
             "frame_range": {"start": int(processed_frame_ids[0]), "end": int(processed_frame_ids[-1])},
             "frames_processed": frame_count,
             "detectors": {"lidar": "MMDetection3D PointPillars", "camera": "YOLO26 ONNX"},
+            "reid": {"enabled": reid_enabled, "backend": "FastReID vehicleid_bot_R50-ibn" if reid_enabled else "disabled", "reactivations": reactivations},
             "models": {
                 "lidar_config": str(_resolve(str(real["config"]))),
                 "lidar_checkpoint": str(_resolve(str(real["checkpoint"]))),

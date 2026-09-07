@@ -1,0 +1,12 @@
+reid:
+  enabled: false
+  backend: fastreid
+  # FastReID 官方 VehicleID 配置；通过 --fastreid-root 指向外部源码 checkout。
+  config: /tmp/fast-reid/configs/VehicleID/bagtricks_R50-ibn.yml
+  weights: weights/vehicleid_bot_R50-ibn.pth
+  device: cuda:0
+  similarity_threshold: 0.75
+  min_gap_frames: 10
+  min_fusion_confidence: 0.5
+  gallery_momentum: 0.9
+  gallery_max_age_frames: 300

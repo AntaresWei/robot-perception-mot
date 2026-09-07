@@ -1,0 +1,1852 @@
+diff --git a/README.md b/README.md
+index 2ebe5e3..0a28fc1 100644
+--- a/README.md
++++ b/README.md
+@@ -371,8 +371,9 @@ IDF1 `0.896552`、IDS `10`。这是合成 tracker demo，不是 KITTI Detector 
+    `lidar_detection`、`camera_detection`、`projected_bbox`、`fusion_confidence` 与
+    可选 `track_id`。
+ 
+-当前 Camera 侧是 `SyntheticCameraDetector`，它把 KITTI 2D 标签作为 mock 输入，
+-只用于流程验证；不能据此宣称已经完成真实 Camera detector 或学习式融合。
++单帧 `run_fusion_demo.py` 仍支持 `SyntheticCameraDetector` 作为几何流程 mock；真实
++端到端脚本使用 YOLO26 ONNX Camera detector。FastReID 只作为可选外观身份恢复适配器，
++不把 2D 观测直接写入 3D Kalman state，也不是 neural sensor fusion。
+ 
+ ## 16. ROS2
+ 
+@@ -422,6 +423,25 @@ CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python
+ LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
+ 但没有偷偷插入真实 PointPillars 推理链。
+ 
++## FastReID 身份恢复（可选）
++
++FastReID 作为独立的外观特征适配器，不进入 Tracker 的 Kalman 或 Hungarian 核心。
++使用 VehicleID 的 `vehicleid_bot_R50-ibn.pth`：只有在 2D/3D 已可靠匹配且
++`fusion_confidence` 达到阈值时，才把 YOLO26 crop 的 embedding 写入 gallery；长时间
++消失后，新 3D Track 通过类别、间隔和 cosine similarity 查询 gallery，恢复 public ID。
++
++将完整权重放到 `weights/vehicleid_bot_R50-ibn.pth`，并准备 FastReID 源码（例如
++`/tmp/fast-reid`）后运行：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 \
++/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/run_end_to_end.py --sequence 0000 --device cuda:0 \
++  --enable-reid --fastreid-root /tmp/fast-reid
++```
++
++没有完整权重或 FastReID 依赖时，脚本会明确失败，不会生成伪造的 appearance feature。
++
+ ## 17. Benchmark
+ 
+ 运行：
+diff --git a/scripts/run_end_to_end.py b/scripts/run_end_to_end.py
+index 371422a..52f9a1f 100644
+--- a/scripts/run_end_to_end.py
++++ b/scripts/run_end_to_end.py
+@@ -35,6 +35,7 @@ from robot_perception.fusion import (  # noqa: E402
+     associate_camera_lidar_detections,
+     project_detection_to_image,
+ )
++from robot_perception.reid import AppearanceGallery, FastReIDEncoder, ReIDIdentityManager  # noqa: E402
+ from robot_perception.tracking import MultiObjectTracker  # noqa: E402
+ 
+ 
+@@ -90,6 +91,7 @@ def _attach_track_ids(
+     fusion_result: object,
+     track_detections: list[Detection3D],
+     tracker: MultiObjectTracker,
++    public_id_by_internal: dict[int, int] | None = None,
+ ) -> tuple[FusedDetection, ...]:
+     """Restore Track IDs after fusion association without changing fusion core code."""
+ 
+@@ -102,7 +104,8 @@ def _attach_track_ids(
+             fused.append(item)
+             continue
+         distances = [float(np.linalg.norm(track.state[:3] - item.lidar_detection.position)) for track in confirmed_tracks]
+-        track_id = confirmed_tracks[int(np.argmin(distances))].track_id
++        internal_track_id = confirmed_tracks[int(np.argmin(distances))].track_id
++        track_id = int((public_id_by_internal or {}).get(internal_track_id, internal_track_id))
+         camera_detection = Camera2DDetection(
+             bbox=item.camera_detection.bbox,
+             score=item.camera_detection.score,
+@@ -179,6 +182,9 @@ def main(argv: list[str] | None = None) -> int:
+     parser.add_argument("--device", help="PointPillars device, e.g. cuda:0")
+     parser.add_argument("--min-hits", type=int, help="Override tracker confirmation hits for replay smoke/experiments")
+     parser.add_argument("--camera-model", type=Path, help="Override detector.camera.model (use hold-out ONNX for honest evaluation)")
++    parser.add_argument("--enable-reid", action="store_true", help="Enable optional FastReID appearance gallery")
++    parser.add_argument("--reid-config", type=Path, default=REPO_ROOT / "configs" / "reid.yaml")
++    parser.add_argument("--fastreid-root", type=Path, help="FastReID source checkout, e.g. /tmp/fast-reid")
+     args = parser.parse_args(argv)
+     writer = None
+     writer_size: tuple[int, int] | None = None
+@@ -222,6 +228,29 @@ def main(argv: list[str] | None = None) -> int:
+         fusion_settings = fusion_config.get("fusion", {})
+         if not isinstance(fusion_settings, dict):
+             raise ValueError("fusion config must contain a fusion mapping")
++        reid_settings = _load_yaml(args.reid_config).get("reid", {})
++        if not isinstance(reid_settings, dict):
++            raise ValueError("reid config must contain a reid mapping")
++        reid_enabled = bool(args.enable_reid or reid_settings.get("enabled", False))
++        reid_manager: ReIDIdentityManager | None = None
++        if reid_enabled:
++            fastreid_root = args.fastreid_root or reid_settings.get("fastreid_root")
++            reid_encoder = FastReIDEncoder(
++                _resolve(str(reid_settings["config"])),
++                _resolve(str(reid_settings["weights"])),
++                fastreid_root=None if fastreid_root is None else _resolve(str(fastreid_root)),
++                device=str(reid_settings.get("device", "cuda:0")),
++            )
++            reid_manager = ReIDIdentityManager(
++                reid_encoder,
++                gallery=AppearanceGallery(
++                    momentum=float(reid_settings.get("gallery_momentum", 0.9)),
++                    max_age_frames=int(reid_settings.get("gallery_max_age_frames", 300)),
++                ),
++                similarity_threshold=float(reid_settings.get("similarity_threshold", 0.75)),
++                min_gap_frames=int(reid_settings.get("min_gap_frames", 10)),
++                min_fusion_confidence=float(reid_settings.get("min_fusion_confidence", 0.5)),
++            )
+         output_video = args.output_video or REPO_ROOT / "outputs" / "videos" / f"end_to_end_{args.sequence}.mp4"
+         output_json = args.output_json or REPO_ROOT / "outputs" / "metrics" / f"end_to_end_{args.sequence}.json"
+         output_video = _resolve(output_video)
+@@ -234,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
+         frame_count = 0
+         processed_frame_ids: list[int] = []
+         timings: list[float] = []
++        reactivations = 0
+         start_time = perf_counter()
+         indexed_frame_ids = [key.frame_id for key in getattr(dataset, "_frame_keys", ())]
+         for index, frame_id in enumerate(indexed_frame_ids):
+@@ -254,7 +284,38 @@ def main(argv: list[str] | None = None) -> int:
+                 center_distance_threshold=float(fusion_settings.get("center_distance_threshold", 80.0)),
+                 coordinate_frame="lidar",
+             )
+-            fused_detections = _attach_track_ids(fusion_result, track_detections, tracker)
++            public_ids = {
++                track.track_id: (reid_manager.public_id(track.track_id) if reid_manager else track.track_id)
++                for track in tracker.tracks
++            }
++            if reid_manager is not None:
++                confirmed_tracks = [
++                    track for track in tracker.tracks if track.status == "Confirmed" and track.time_since_update == 0
++                ]
++                active_public_ids = set(public_ids.values())
++                for item in fusion_result.fused_detections:
++                    if not confirmed_tracks:
++                        continue
++                    nearest = min(
++                        confirmed_tracks,
++                        key=lambda track: float(np.linalg.norm(track.state[:3] - item.lidar_detection.position)),
++                    )
++                    decision = reid_manager.resolve(
++                        internal_track_id=nearest.track_id,
++                        class_id=item.camera_detection.class_id,
++                        frame_id=frame.frame_id,
++                        frame=frame,
++                        bbox=item.camera_detection.bbox,
++                        fusion_confidence=item.fusion_confidence,
++                        active_public_ids=active_public_ids - {public_ids.get(nearest.track_id, nearest.track_id)},
++                        detection_score=item.camera_detection.score,
++                    )
++                    public_ids[nearest.track_id] = decision.public_track_id
++                    active_public_ids.add(decision.public_track_id)
++                    if decision.reactivated:
++                        reactivations += 1
++                reid_manager.remove_deleted({track.track_id for track in tracker.tracks})
++            fused_detections = _attach_track_ids(fusion_result, track_detections, tracker, public_ids)
+             image = _draw_frame(frame, calibration, lidar_detections, camera_detections, track_detections, fused_detections)
+             height, width = image.shape[:2]
+             if height % 2 or width % 2:
+@@ -286,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
+             "frame_range": {"start": int(processed_frame_ids[0]), "end": int(processed_frame_ids[-1])},
+             "frames_processed": frame_count,
+             "detectors": {"lidar": "MMDetection3D PointPillars", "camera": "YOLO26 ONNX"},
++            "reid": {"enabled": reid_enabled, "backend": "FastReID vehicleid_bot_R50-ibn" if reid_enabled else "disabled", "reactivations": reactivations},
+             "models": {
+                 "lidar_config": str(_resolve(str(real["config"]))),
+                 "lidar_checkpoint": str(_resolve(str(real["checkpoint"]))),
+diff --git a/configs/reid.yaml b/configs/reid.yaml
+new file mode 100644
+index 0000000..ad697c5
+--- /dev/null
++++ b/configs/reid.yaml
+@@ -0,0 +1,12 @@
++reid:
++  enabled: false
++  backend: fastreid
++  # FastReID 官方 VehicleID 配置；通过 --fastreid-root 指向外部源码 checkout。
++  config: /tmp/fast-reid/configs/VehicleID/bagtricks_R50-ibn.yml
++  weights: weights/vehicleid_bot_R50-ibn.pth
++  device: cuda:0
++  similarity_threshold: 0.75
++  min_gap_frames: 10
++  min_fusion_confidence: 0.5
++  gallery_momentum: 0.9
++  gallery_max_age_frames: 300
+diff --git a/docs/project_tutorial_zh.md b/docs/project_tutorial_zh.md
+new file mode 100644
+index 0000000..3fd3cd5
+--- /dev/null
++++ b/docs/project_tutorial_zh.md
+@@ -0,0 +1,653 @@
++# robot-perception-mot 中文项目教程
++
++这是一份面向初学者的项目教程。建议先通读流程，再打开源码逐个函数对照。教程
++描述的是当前仓库真实实现，不把计划中的功能写成已经完成的功能。
++
++## 1. 先建立整体认识
++
++这个项目不是“一个模型输入一张图片然后输出框”，而是一条多传感器时间序列：
++
++```text
++KITTI image + LiDAR + calibration + label
++        ↓
++      FrameData
++        ↓
++Camera 2D detector       LiDAR 3D detector
++YOLO26 ONNX              PointPillars
++        ↓                       ↓
++Camera2DDetection[]      Detection3D[]
++                                ↓
++                     Kalman + Gating + Hungarian
++                                ↓
++                           TrackState[]
++                                ↓
++              3D box projection + 2D/3D association
++                                ↓
++                         FusedDetection[]
++                                ↓
++                    PNG / MP4 / JSON / ROS2 topic
++```
++
++最重要的工程边界是：
++
++- Dataset 负责读文件，不负责检测和跟踪；
++- Detector 负责把模型输出转换成统一数据类；
++- Tracker 只接收 `Detection3D`，不导入 YOLO、PointPillars 或 ROS2；
++- Fusion 负责投影、跨模态匹配和融合结果，不修改 Tracker 核心数学；
++- ROS2 只是适配层，不把 `rclpy` 塞进算法模块。
++
++## 2. 一个 frame 到底包含什么
++
++`FrameData` 定义在 `src/robot_perception/common/types.py`：
++
++```python
++FrameData(
++    sequence_id="0000",
++    frame_id=100,
++    image=image,              # H x W x 3，OpenCV BGR
++    lidar_points=points,      # N x 4，[x, y, z, intensity]
++    calibration=calibration,
++    annotations=annotations,
++)
++```
++
++KITTI Tracking 的标签字段与普通目标检测不完全一样。3D `location` 是 camera
++坐标系下的 bottom-center，尺寸原始顺序是 `h, w, l`。项目内部把尺寸统一成
++`[l, w, h]`，并在需要作为 box center 时减去一半高度。这是非常容易造成“框看起来
++整体上下偏移”的地方。
++
++数据读取基准是 LiDAR 文件，而不是图片或标签：如果某个图像缺失，Loader 会在读取
++该 frame 时报错；如果标签为空，`annotations` 是空列表；如果 `.bin` 不是 4 的倍数，
++或者包含 NaN/Inf，会直接拒绝。这样做是为了尽早暴露数据问题，而不是把坏数据传到
++后面的矩阵运算中。
++
++## 3. 从哪里开始运行
++
++主项目环境使用 Python 3.10。先从仓库根目录检查一帧：
++
++```bash
++conda run -n robot-perception-mot python scripts/inspect_kitti.py \
++  --sequence 0000 --frame 100
++```
++
++典型输出包含：
++
++```text
++Image shape: (375, 1242, 3)
++LiDAR shape: (122624, 4)
++Number of annotations: 7
++```
++
++这里的 7 个标签可能包含 `DontCare`，不能直接当作 7 个可跟踪目标。
++
++## 4. 点云预处理：为什么有多个版本
++
++`preprocess_point_cloud()` 的顺序是：
++
++```text
++raw
++ ↓ remove_invalid_points
++valid
++ ↓ crop_roi
++roi
++ ↓ voxel_downsample
++voxel
++ ↓ statistical/radius outlier filter
++outlier_filtered
++ ↓ segment_ground_ransac
++ground + non_ground
++```
++
++所有参数来自 `configs/pipeline.yaml`。`PointCloudPreprocessResult` 保留各阶段数组，
++所以可以回答“到底是哪一步把点数从 122624 降到了 15349”。
++
++一个关键实践判断：**预处理可以存在，不代表必须插入每个 Detector。** 当前官方
++PointPillars 预训练模型接收 KITTI 原始 `.bin`，模型内部已经有自己的点云范围和
++pillar 编码逻辑。外部先做 ground removal 可能改变训练分布，甚至把目标下半部分删掉。
++因此当前项目：
++
++- PointPillars 真实推理使用原始点云；
++- `non_ground` 主要用于可视化和独立预处理实验；
++- 若要把预处理接到 Detector 前，必须重新做检测精度和运行速度对比，不能凭感觉接入。
++
++## 5. Camera 2D 检测：YOLO26 到统一接口
++
++原始 `yolo26s.pt` 是 COCO 80 类预训练模型，不是 KITTI 三类模型。项目先使用
++`scripts/prepare_kitti_yolo.py` 把 KITTI 标签转成 YOLO 格式，再训练三类 head：
++
++```text
++YOLO label 0 -> Car
++YOLO label 1 -> Pedestrian
++YOLO label 2 -> Cyclist
++```
++
++`Van`、`Truck` 按当前项目规则归入 `Car`，`DontCare` 被忽略。训练数据按 sequence
++切分，避免同一段连续视频的相邻帧同时出现在 train 和 val。
++
++推理时，`Yolo26OnnxCameraDetector` 做四件容易被忽略的事：
++
++1. 对原图做 centered letterbox，而不是简单拉伸；
++2. ONNX 前向输出 `[x1, y1, x2, y2, score, class]`；
++3. 把 padding 和缩放逆变换回原始图像像素；
++4. 按类别执行 NMS，再映射成 `Camera2DDetection`。
++
++因此不能直接把 ONNX 的框坐标当作原图坐标。最常见的错误是忘记去除上下 padding，
++导致框整体偏移。
++
++## 6. LiDAR 3D 检测：PointPillars 的职责
++
++PointPillars 来自官方 MMDetection3D，模型输入是 LiDAR `.bin`，输出是：
++
++```text
++boxes_3d
++scores_3d
++labels_3d
++```
++
++项目的 `MMDet3DPointPillarsAdapter` 只做输出适配和阈值过滤，不重新实现神经网络：
++
++```text
++model label 0 -> Pedestrian -> project class_id 2
++model label 1 -> Cyclist    -> project class_id 3
++model label 2 -> Car        -> project class_id 1
++```
++
++真实模型使用旧版 PyTorch/MMCV，因此与主环境隔离在 `mmdet3d-kitti`。环境问题不要
++用“升级所有包”解决；旧版 MMCV 很容易因为 CUDA、NumPy 或 PyTorch 版本不匹配而失效。
++
++## 7. 坐标系：框为什么会错位
++
++KITTI 中至少要区分：
++
++```text
++LiDAR frame
++Camera frame
++Rectified camera frame
++Image pixel frame
++```
++
++点投影是：
++
++```text
++lidar xyz
++  --Tr_velo_to_cam--> camera xyz
++  --R0_rect-------> rectified camera xyz
++  --P2------------> pixel (u, v)
++```
++
++代码先把点变成 homogeneous `[x, y, z, 1]`，再做矩阵乘法。投影前必须过滤：
++
++- NaN/Inf；
++- camera z <= 0 的后方点；
++- 图像边界之外的像素。
++
++检查坐标问题的实践顺序：
++
++1. 用一个 identity calibration 写单元测试；
++2. 用一个已知平移矩阵验证坐标变化；
++3. 先画 raw LiDAR 投影，不要先画 non-ground；
++4. 再检查 box 的 camera/lidar 坐标声明是否正确；
++5. 最后才调 IoU 阈值。
++
++很多所谓“融合算法不好”的问题，实际是 camera bottom-center 没有还原成 box center，
++或者把 LiDAR box 当成 camera box 旋转。
++
++## 8. Tracker 每一帧做什么
++
++生产 Tracker 是 `MultiObjectTracker`，每帧大致如下：
++
++```text
++active Track
++    ↓ predict(dt)
++predicted state/covariance
++    ↓ Mahalanobis gating
++valid cost matrix
++    ↓ Hungarian
++matched pairs
++    ├─ matched: Track.update(detection)
++    ├─ unmatched track: Lost / Deleted
++    └─ unmatched detection: create new Track
++```
++
++状态是：
++
++```text
++[px, py, pz, vx, vy, vz]
++```
++
++`min_hits=3` 的实际含义是：一个新目标至少连续/累计得到足够多次有效更新后才会被
++输出为 Confirmed。于是第一帧可能有 12 个检测，但 confirmed track 是 0，这不是 bug，
++而是生命周期设计。做单帧 smoke 时可以用 `--min-hits 1`，正式实验应使用配置值。
++
++### 8.1 漏检后能不能找回
++
++可以，但只在 `max_age` 窗口内找回。一次没有检测到目标时，Tracker 不会马上删除
++Track，而是：
++
++```text
++Confirmed
++   ↓ 本帧没有匹配
++Lost（继续 predict）
++   ↓ 在 max_age 帧内重新出现，并通过 gating
++原 Track.update()
++   ↓
++恢复为 Confirmed，保留原 track_id
++```
++
++`time_since_update` 会在 `predict()` 时增加，在 `Track.update()` 时归零。当
++`time_since_update >= max_age` 时，Track 变为 `Deleted`。Deleted Track 不会再被
++恢复；目标下一次出现会创建新 Track 和新 ID。
++
++未启用 FastReID 时，长时间遮挡后只能重新建轨迹；启用后，能否找回还取决于特征库
++有效期、相似度阈值和当前 active ID 排除。能否通过运动恢复短期目标取决于三个因素：
++
++- 目标消失的帧数是否小于 `max_age`；
++- 重新出现的位置是否落在 Kalman 预测的马氏门内；
++- 期间是否有其他 detection 抢占了这个 Track 的匹配。
++
++这也是为什么 `max_age` 不能随便调大：太小会频繁换 ID，太大则可能把错误检测
++吸附到一条已经消失的轨迹上。
++
++### 8.2 马氏门控到底做什么
++
++马氏门控不是“选最近的 detection”，而是先判断 pair 是否统计上合理：
++
++```text
++y = detection_position - predicted_position
++S = H P H^T + R
++d² = y^T S^-1 y
++```
++
++其中 `P` 来自 Kalman 的预测协方差，`R` 是 measurement noise。当前实现优先用
++线性方程求解而不是显式矩阵求逆。若 `d² > gating_threshold`，这个 track/detection
++pair 会被标记为无效，Hungarian 不允许它参与匹配。
++
++它解决的是“几何距离相同但可信度不同”的问题：
++
++```text
++协方差小：模型很确定，允许的偏差小
++协方差大：模型不确定，允许的偏差大
++```
++
++当前默认 `gating_threshold=9.21` 是三维位置观测常用的卡方阈值量级。门控负责
++删掉不可能的边，Hungarian 才负责在剩余边中做全局一对一选择；二者不是同一个步骤。
++
++### 8.3 ID 如何管理
++
++Tracker 内部维护 `_next_track_id`，新建 Track 时取当前值后加一：
++
++```text
++_next_track_id = 1
++new Track -> 1
++new Track -> 2
++new Track -> 3
++```
++
++ID 单调递增且不复用。Lost Track 恢复时使用原 ID，Deleted Track 再出现时一定获得
++新 ID。它与 KITTI annotation 的 `track_id`、YOLO 检测序号、PointPillars 检测序号
++都不是同一个概念：
++
++```text
++KITTI track_id     = 数据集真值身份
++Tracker track_id   = 本次运行分配的预测身份
++detection index    = 当前帧数组下标，不能跨帧使用
++```
++
++真实评估时，预测 `track_id` 要通过位置/类别匹配与 KITTI 真值身份比较，不能直接
++拿两个整数相等来判断跟踪正确。
++
++### 8.4 2D 检测当前是否也做 Kalman
++
++当前没有。YOLO26 输出的 `Camera2DDetection` 只经过 score threshold、letterbox
++逆变换和 NMS，不进入项目的 3D Kalman Filter。当前数据流是：
++
++```text
++PointPillars 3D Detection -> 3D Kalman/Tracker
++YOLO26 2D Detection       -> Projection 后的跨模态 Association
++```
++
++原因是当前 Kalman 状态是 `[px, py, pz, vx, vy, vz]`，而 2D bbox 是像素坐标
++`[x1, y1, x2, y2]`，没有直接深度。若要对 2D 做时间滤波，可以单独实现
++`[cx, cy, w, h, vx, vy, vw, vh]` 的 2D tracker；若要用 2D 更新 3D，则需要
++相机观测模型和 EKF/UKF，目前都不在本项目实现范围内。
++
++### 置信度不等于 Track 可靠性
++
++Detector score 只表示模型对当前检测框的信心，不等于轨迹身份稳定。工程上通常会
++同时考虑：
++
++- detection score；
++- Mahalanobis distance；
++- track age/hits；
++- `time_since_update`；
++- 目标类别和尺寸变化。
++
++低分框不一定立刻删除，高分框也不一定一定正确。实际系统经常采用“检测分数、运动
++一致性、轨迹生命周期”联合决策。
++
++## 9. ReID 应该什么时候用
++
++当前项目已提供可选的 FastReID 外观适配器，但它不改变 3D Tracker 的主状态。ReID 是
++外观特征，用于回答：
++
++> 这个新检测是否仍然属于之前的那个目标？
++
++实际工程中不建议每一对 track/detection 都强制跑 ReID，原因是耗时、光照变化和相似
++外观会制造新的误匹配。常见策略是：
++
++```text
++高置信度检测 + 运动距离小
++    -> 直接接受几何/运动关联，不调用 ReID
++
++低置信度、遮挡恢复、运动 gating 边界、轨迹交叉
++    -> 才使用 ReID 作为二级证据
++
++ReID 与运动都不一致
++    -> 不匹配，等待新轨迹或保持 Lost
++```
++
++ReID 应当是 gated fallback，而不是替代 Kalman/Hungarian 的全局关联。当前实现由
++`FastReIDEncoder`、`AppearanceGallery` 和 `ReIDIdentityManager` 组成：FastReID 负责
++crop -> embedding，gallery 负责 EMA 特征记录，manager 负责长时间消失后的 public ID
++恢复；Tracker 本身不 import FastReID。
++
++本项目使用 VehicleID 的 `vehicleid_bot_R50-ibn.pth`，官方配置为
++`/tmp/fast-reid/configs/VehicleID/bagtricks_R50-ibn.yml`。运行环境需要 FastReID 源码
++和 `yacs`、`faiss-cpu` 等可选依赖；主项目环境不强制安装它们。启用方式：
++
++```bash
++PYTHONPATH=/tmp/fast-reid:$PYTHONPATH \
++  /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/run_end_to_end.py --sequence 0000 --enable-reid \
++  --fastreid-root /tmp/fast-reid
++```
++
++FastReID 输出 2048 维 L2-normalized vehicle embedding。当前只在可靠的 2D/3D
++`FusedDetection` 上更新 gallery；没有可靠 crop 时不更新，避免外观库被误检污染。
++
++## 10. Camera-LiDAR Fusion 到底融合了什么
++
++必须区分三个阶段：
++
++1. **Projection**：把 3D box 投影成图像 2D box；
++2. **Cross-modal association**：用类别、IoU、中心距离判断 2D/3D 是否对应；
++3. **Sensor fusion**：生成 `FusedDetection`，保留两侧观测和匹配置信度。
++
++当前不是把 2D bbox 和 3D position 简单平均。原因是 2D bbox 没有直接深度，不能可靠
++地修正 3D 位置。当前 Tracker 的 3D state 由 LiDAR 3D detection 更新，YOLO26 主要
++提供图像侧目标和一致性证据。
++
++如果未来使用 2D bbox 更新 3D state，需要定义 camera measurement model、Jacobian 或
++UKF sigma points、观测噪声，以及误匹配保护。这才属于 EKF/UKF 状态级融合。
++
++当前单帧 `run_fusion_demo.py` 仍可使用 `SyntheticCameraDetector` 做几何流程 mock；
++真实端到端脚本使用 YOLO26 ONNX。FastReID 是可选的车辆外观身份恢复适配器，不把
++2D 观测直接写入 3D Kalman state，也不是 neural sensor fusion。
++
++### 10.1 当前 2D/3D 跨模态关联的具体步骤
++
++在真实端到端脚本中，先取 Tracker 当前帧已 Confirmed 的 3D track，临时包装成
++`Detection3D`，再调用 `associate_camera_lidar_detections()`：
++
++```text
++TrackState（LiDAR 坐标）
++    ↓ project_detection_to_image()
++projected 2D bbox（像素）
++    + YOLO26 Camera2DDetection（像素）
++    ↓ 类别一致性检查
++    ↓ 计算 IoU 和 bbox 中心距离
++    ↓ IoU 或中心距离通过阈值
++    ↓ IoU 优先、中心距离次优的贪心一对一匹配
++FusedDetection
++```
++
++这里有一个容易混淆的细节：MOT Tracker 内部的 detection-to-track 关联使用
++Mahalanobis + Hungarian；Camera-LiDAR Fusion 当前使用的是 IoU 优先的贪心一对一
++匹配。Fusion 不会把 YOLO 检测直接写回 Kalman state。
++
++### 10.2 中心距离为什么还要存在
++
++中心距离是两个图像框中心的像素欧氏距离：
++
++```text
++|| center(projected_3d_bbox) - center(camera_2d_bbox) ||₂
++```
++
++它用于补充 IoU：投影框可能因为 3D 尺寸、遮挡或截断导致面积重叠很小，但两个
++中心仍然接近。当前默认阈值是 `80.0`，单位是像素，不是米；匹配条件是：
++
++```text
++class_id 相同 且 (IoU >= iou_threshold 或 center_distance <= threshold)
++```
++
++中心距离阈值太小会漏掉有标定误差的正确 pair，太大会把相邻目标错误连起来。它
++不能单独证明两个框是同一个物体，因此必须结合类别、IoU 和一对一约束；当前可选的
++FastReID 只在可靠关联后提供车辆外观相似度，作为长时间身份恢复的二级证据。
++
++### 10.3 未匹配的 2D 和 3D 怎么处理
++
++- 只有 LiDAR 3D：可以继续进入 Tracker，表示 Camera 未检出、遮挡或不在 FOV；
++- 只有 Camera 2D：当前只保留为 Camera-side observation，不凭空生成 3D 深度；
++- 两者匹配：生成 `FusedDetection`，保存两侧 detection、projected bbox、confidence
++  和真实 Tracker ID。
++
++这是一种保守策略：宁可暂时不融合，也不把错误的 2D 框硬塞给 3D 状态估计。
++
++## 11. 统一端到端脚本
++
++真实端到端入口是：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 \
++/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++scripts/run_end_to_end.py --sequence 0000 --device cuda:0
++```
++
++脚本内部的实际顺序是：
++
++```text
++load FrameData
++  ↓
++PointPillars.predict(frame)
++  ↓
++Yolo26OnnxCameraDetector.predict(frame)
++  ↓
++MultiObjectTracker.update(lidar_detections)
++  ↓
++把 confirmed Track 转成临时 Detection3D
++  ↓
++project_detection_to_image()
++  ↓
++associate_camera_lidar_detections()
++  ↓
++绘制原始框、投影框、融合框
++  ↓
++VideoWriter + summary JSON
++```
++
++当前真实 `0000` 全序列输出曾记录为：154 帧、PointPillars 1,594 个 3D 框、YOLO26
++727 个 2D 框、确认轨迹 1,214 个、融合结果 482 个。运行时间受 GPU、模型缓存、视频
++编码和机器负载影响，不能把一次 FPS 当成固定理论性能。
++
++## 12. 真实 MOT 评估与 GT 验证的区别
++
++`evaluate.py` 使用 GT/NoisyGT，是为了隔离验证 Tracker。它回答：
++
++```text
++给 Tracker 理想或可控噪声检测，生命周期和关联逻辑是否正确？
++```
++
++`evaluate_real_mot.py` 才使用真实 PointPillars 输出，并将 KITTI camera GT 转到 LiDAR
++坐标后评估。它回答：
++
++```text
++真实误检、漏检和定位误差进入后，Tracker 的表现怎样？
++```
++
++当前真实 PointPillars `0000` 全序列记录：
++
++```text
++GT 711, matches 448, FP 766, FN 263, IDS 8
++MOTA -0.4585, IDF1 0.4655, FPS 25.10
++```
++
++负 MOTA 不是应该隐藏的结果，而是说明真实检测质量和 Tracker 输入质量仍是瓶颈。
++
++## 13. 常见实践坑
++
++### 13.1 训练数据泄漏
++
++KITTI Tracking 是连续视频。随机按图片切分会让几乎相同的相邻帧同时出现在 train
++和 val，指标看起来很好但泛化不可信。应按 sequence 切分，最好把评估 sequence 完全
++留作 hold-out。
++
++### 13.2 低分框不是简单删除
++
++低置信度检测可能是遮挡目标，也可能是背景误检。常见做法是先提高关联门槛、限制
++生命周期影响，或让低分框只参与 tentative track，而不是完全丢弃。
++
++### 13.3 漏检与轨迹删除不同
++
++一次漏检不代表目标消失。`max_age` 允许短暂 Lost；过早删除会造成新 ID，过晚保留
++会造成漂浮轨迹。这个参数必须通过漏检实验而不是凭经验设置。
++
++### 13.4 视频编码会裁掉奇数尺寸
++
++KITTI 图像高度 375 是奇数。某些 `mp4v` 编码器会静默改成 374，因此视频脚本在写
++入前补一行 padding。padding 只用于视频，不改变任何投影坐标。
++
++### 13.5 先检查环境再怀疑模型
++
++PointPillars 使用旧环境，YOLO26 ONNX 使用 OpenCV DNN，主项目使用 Python 3.10。
++先检查 `torch.cuda.is_available()`、模型路径、ONNX 输入输出 shape，再分析算法效果。
++
++## 14. 面试回答模板
++
++### 问：为什么 Tracker 不直接 import Detector？
++
++答：Detector 输出先统一成 `Detection3D`，Tracker 只依赖这个数据契约。这样可以把
++GT、PointPillars 或未来的 CenterPoint 替换掉，而不用修改跟踪核心。
++
++### 问：为什么有 2D 框和 3D 框两个框？
++
++答：它们来自不同传感器和坐标系。先把 3D 框投影成 2D，再用类别、IoU 和中心距离做
++跨模态一对一关联，匹配后生成 `FusedDetection`。可视化保留两个原始框，是为了检查
++标定和匹配质量，不是重复输出。
++
++### 问：为什么不用 2D 框直接修正 3D 位置？
++
++答：2D bbox 没有直接深度，简单平均会引入错误深度。需要明确的 camera measurement
++model、观测噪声和 EKF/UKF 更新，目前项目采用更稳妥的 object-level fusion。
++
++### 问：为什么有 MOTA=1.0，又有 MOTA=-0.4585？
++
++答：前者是 GTDetector 驱动的 Tracker validation，后者是真实 PointPillars 输出驱动的
++MOT 评估。两者输入不同，不能混为一个系统精度结论。
++
++### 问：ReID 应该放在哪里？
++
++答：作为独立 AppearanceAdapter，在运动 gating 后对低置信度、遮挡恢复和轨迹交叉等
++困难 pair 提供二级 cost。高置信度且运动一致时不调用 ReID，以控制延迟和误匹配。
++当前项目的 ReID 需要显式启用，并依赖外部 FastReID 源码及 VehicleID 权重。
++
++### 问：为什么 PointPillars 前面不默认做 ground removal？
++
++答：官方预训练模型已经假设 KITTI 原始输入分布。外部 ground removal 会改变输入并
++可能删除目标点，所以当前只在可视化/独立实验使用；若要接入，必须做 ablation。
++
++### 问：如何证明不是数据泄漏？
++
++答：按 sequence 切分训练和验证，评估 sequence 不进入训练；同时把训练配置、Git hash、
++帧范围和模型路径写入结果 JSON。
++
++### 问：Track Lost 后重新出现，什么时候保留旧 ID？
++
++答：只要 Track 尚未超过 `max_age` 变成 Deleted，且新 detection 通过马氏门控并被
++关联到原 Track，就调用原 Track 的 `update()`，保留旧 ID。超过窗口或门控失败后，
++只能新建 Track；启用 FastReID 后，才会在可靠 2D/3D 匹配的基础上尝试长时间身份恢复。
++
++### 问：马氏门控和 Hungarian 为什么都需要？
++
++答：马氏门控删除统计上不可能的边，Hungarian 在剩余候选上做全局一对一最优分配。
++没有 gating 时，Hungarian 可能被迫选择一个很远的错误 pair；没有 Hungarian 时，
++多个 Track 可能竞争同一个 detection。
++
++### 问：为什么不用一个全局 ID 表直接管理目标身份？
++
++答：Track ID 是运行时预测身份，必须由生命周期和关联维护；KITTI `track_id` 是离线
++真值，不能泄漏给 Tracker。评估阶段才把两者通过空间/类别匹配比较。
++
++### 问：为什么 Camera 2D 不进入当前 Kalman？
++
++答：当前 KF 状态是三维位置和速度，2D bbox 没有直接深度。直接把像素坐标当三维位置
++会造成量纲和观测模型错误。需要独立 2D KF，或使用 EKF/UKF 建立投影观测模型。
++
++### 问：2D/3D 关联为什么同时使用 IoU 和中心距离？
++
++答：IoU 对框大小和截断敏感，中心距离对小幅几何偏差更宽容。当前使用类别一致且
++IoU 或中心距离满足阈值，再做一对一匹配；中心距离阈值是像素单位，不是三维米制距离。
++
++### 问：Fusion 为什么不直接把两个框平均成一个框？
++
++答：2D 框没有深度，不能和 3D position/dimensions 做同量纲平均。当前融合保留两侧
++观测和置信度，3D 状态仍由 LiDAR Tracker 负责，避免错误 2D 深度把轨迹拉偏。
++
++### 问：低置信度检测应该怎么处理？
++
++答：不要只按一个 score 开关处理。可以让低分框只参与 tentative track，或要求更严格
++的运动/几何一致性；在遮挡恢复、gating 边界、交叉目标等困难 pair 上再启用 ReID
++作为二级证据。当前使用 FastReID，接口仍保持独立，Tracker 不依赖具体外观网络。
++
++### 问：为什么真实 PointPillars MOT 的 MOTA 可能是负数？
++
++答：MOTA 会同时惩罚 FP、FN 和 IDS。若检测器误检/漏检很多，错误数超过 GT 数量，
++MOTA 就可能小于 0；这是真实 detector-driven 结果，不应改成 GT validation 的 1.0。
++
++### 问：如何定位“框不对齐”是模型问题还是标定问题？
++
++答：先用 identity/known transform 单测，再检查 camera bottom-center 到 box center、
++`Tr_velo_to_cam`、`R0_rect`、`P2` 的顺序，最后用 raw 点云投影检查 FOV。不要一开始
++调 IoU 或中心距离阈值，否则会用关联参数掩盖坐标错误。
++
++### 问：为什么 PointPillars 前面不默认做 ground removal？
++
++答：官方权重假设 KITTI 原始点云分布，外部地面移除可能删除目标点并改变输入分布。
++当前预处理用于独立分析和可视化；若接入 Detector，必须做 raw/non-ground ablation。
++
++### 问：端到端 FPS 为什么和单个模块 FPS 不一样？
++
++答：端到端包含图像解码、PointPillars GPU 推理、YOLO ONNX CPU 推理、Tracker、投影、
++融合和视频写入；单模块测速通常只覆盖其中一段。报告性能时必须说明计时边界。
++
++## 15. 建议的学习顺序
++
++```text
++1. scripts/inspect_kitti.py
++2. common/types.py
++3. dataset/kitti.py
++4. dataset/calibration.py + common/geometry.py
++5. pointcloud/preprocess.py
++6. detection/adapter.py
++7. tracking/kalman.py
++8. tracking/association.py + tracking/tracker.py
++9. fusion/camera_lidar.py + fusion/yolo26.py
++10. scripts/run_end_to_end.py
++11. scripts/evaluate_real_mot.py
++12. ros2_ws/src/perception_tracker/
++```
++
++每读完一个模块，都运行对应测试。工程学习不是只看数学公式，而是要同时追踪：
++
++- 输入 shape；
++- 坐标系；
++- score/threshold；
++- 空输入和异常输入；
++- 哪个模块拥有状态；
++- 哪个模块只做适配；
++- 输出如何被下一模块消费。
++
++## 16. 最后记住一句话
++
++这个项目真正展示的不是“调用了两个模型”，而是把不同坐标系、不同时间特性和不同
++可靠性的传感器输出，经过明确的数据契约、状态估计、关联和可视化，组织成一条可以
++测试、复现、解释和承认局限的工程流水线。
+diff --git a/src/robot_perception/reid/__init__.py b/src/robot_perception/reid/__init__.py
+new file mode 100644
+index 0000000..fcc5fae
+--- /dev/null
++++ b/src/robot_perception/reid/__init__.py
+@@ -0,0 +1,13 @@
++"""Optional appearance encoding and identity-gallery utilities."""
++
++from robot_perception.reid.fastreid import FastReIDEncoder
++from robot_perception.reid.gallery import AppearanceGallery, GalleryMatch
++from robot_perception.reid.manager import ReIDIdentityManager, ReIDMatchDecision
++
++__all__ = [
++    "AppearanceGallery",
++    "FastReIDEncoder",
++    "GalleryMatch",
++    "ReIDIdentityManager",
++    "ReIDMatchDecision",
++]
+diff --git a/src/robot_perception/reid/fastreid.py b/src/robot_perception/reid/fastreid.py
+new file mode 100644
+index 0000000..27a8f9d
+--- /dev/null
++++ b/src/robot_perception/reid/fastreid.py
+@@ -0,0 +1,151 @@
++"""FastReID feature encoder kept outside the detector/tracker core."""
++
++from __future__ import annotations
++
++from pathlib import Path
++import sys
++from typing import Any
++
++import numpy as np
++
++from robot_perception.common.types import FrameData
++
++
++class FastReIDEncoder:
++    """Extract L2-normalized vehicle embeddings with FastReID.
++
++    FastReID is imported lazily. The main ``robot-perception-mot`` environment
++    therefore remains usable without the optional FastReID dependency. Tests can
++    inject a predictor object exposing ``__call__(tensor)``.
++    """
++
++    def __init__(
++        self,
++        config_path: str | Path,
++        weights_path: str | Path,
++        *,
++        fastreid_root: str | Path | None = None,
++        device: str = "cuda:0",
++        predictor: Any | None = None,
++        input_size: tuple[int, int] = (256, 256),
++        pixel_mean: tuple[float, float, float] = (123.675, 116.28, 103.53),
++        pixel_std: tuple[float, float, float] = (58.395, 57.12, 57.375),
++    ) -> None:
++        if input_size[0] < 8 or input_size[1] < 8:
++            raise ValueError("input_size must contain dimensions >= 8")
++        if len(pixel_mean) != 3 or len(pixel_std) != 3:
++            raise ValueError("pixel_mean and pixel_std must contain three values")
++        if not np.isfinite(pixel_mean).all() or not np.isfinite(pixel_std).all() or (np.asarray(pixel_std) <= 0).any():
++            raise ValueError("pixel normalization values must be finite and std values positive")
++        self.config_path = Path(config_path)
++        self.weights_path = Path(weights_path)
++        self.device = str(device)
++        self.input_size = (int(input_size[0]), int(input_size[1]))
++        self.pixel_mean = np.asarray(pixel_mean, dtype=np.float32).reshape(1, 1, 3)
++        self.pixel_std = np.asarray(pixel_std, dtype=np.float32).reshape(1, 1, 3)
++        self._predictor = predictor or self._build_predictor(fastreid_root)
++
++    def _build_predictor(self, fastreid_root: str | Path | None) -> Any:
++        if not self.config_path.is_file():
++            raise FileNotFoundError(f"FastReID config not found: {self.config_path}")
++        if not self.weights_path.is_file():
++            raise FileNotFoundError(f"FastReID weights not found: {self.weights_path}")
++        if fastreid_root is not None:
++            root = str(Path(fastreid_root).resolve())
++            if root not in sys.path:
++                sys.path.insert(0, root)
++        try:
++            # FastReID v0.1.1 still imports Mapping/Sequence from collections;
++            # expose the Python 3.10-compatible aliases before importing it.
++            import collections
++            import collections.abc
++            # PyTorch 1.10's tensorboard shim expects ``distutils.version`` to
++            # be imported explicitly in some Python 3.8 environments.
++            try:
++                import distutils
++                import distutils.version  # noqa: F401
++            except ImportError:
++                pass
++
++            for name in ("Mapping", "MutableMapping", "Sequence"):
++                if not hasattr(collections, name):
++                    setattr(collections, name, getattr(collections.abc, name))
++            from fastreid.config import get_cfg
++            from fastreid.engine import DefaultPredictor
++        except ImportError as error:
++            raise RuntimeError(
++                "FastReID is unavailable; install/checkout FastReID in an optional environment "
++                "and pass --fastreid-root"
++            ) from error
++        cfg = get_cfg()
++        cfg.merge_from_file(str(self.config_path))
++        cfg.defrost()
++        cfg.MODEL.WEIGHTS = str(self.weights_path)
++        cfg.MODEL.DEVICE = self.device
++        cfg.freeze()
++        return DefaultPredictor(cfg)
++
++    @staticmethod
++    def _validate_image(image: np.ndarray) -> np.ndarray:
++        array = np.asarray(image)
++        if array.ndim != 3 or array.shape[2] != 3:
++            raise ValueError(f"image must have shape (H, W, 3), got {array.shape}")
++        if not np.issubdtype(array.dtype, np.number) or not np.isfinite(array).all():
++            raise ValueError("image must contain finite numeric values")
++        return array
++
++    @staticmethod
++    def _clip_bbox(bbox: np.ndarray, width: int, height: int) -> tuple[int, int, int, int] | None:
++        values = np.asarray(bbox, dtype=np.float64)
++        if values.shape != (4,) or not np.isfinite(values).all():
++            raise ValueError("bbox must be a finite vector with shape (4,)")
++        x1, y1, x2, y2 = values
++        left = max(0, min(width - 1, int(np.floor(x1))))
++        top = max(0, min(height - 1, int(np.floor(y1))))
++        right = max(0, min(width, int(np.ceil(x2))))
++        bottom = max(0, min(height, int(np.ceil(y2))))
++        if right <= left or bottom <= top:
++            return None
++        return left, top, right, bottom
++
++    def _preprocess_crop(self, crop: np.ndarray) -> Any:
++        import cv2
++        import torch
++
++        resized = cv2.resize(crop, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR)
++        # FastReID configs use RGB ImageNet-style normalization; input FrameData
++        # images are OpenCV BGR, so reverse channels explicitly here.
++        rgb = resized[:, :, ::-1].astype(np.float32)
++        normalized = (rgb - self.pixel_mean) / self.pixel_std
++        tensor = torch.from_numpy(np.ascontiguousarray(normalized.transpose(2, 0, 1))).unsqueeze(0)
++        return tensor
++
++    def encode_crop(self, crop: np.ndarray) -> np.ndarray:
++        """Encode one already-cropped BGR image into a unit-length vector."""
++
++        image = self._validate_image(crop)
++        tensor = self._preprocess_crop(image)
++        output = self._predictor(tensor)
++        if hasattr(output, "detach"):
++            output = output.detach().cpu().numpy()
++        embedding = np.asarray(output, dtype=np.float32)
++        if embedding.ndim == 2 and embedding.shape[0] == 1:
++            embedding = embedding[0]
++        if embedding.ndim != 1 or embedding.size == 0 or not np.isfinite(embedding).all():
++            raise ValueError(f"FastReID predictor must return one finite vector, got {embedding.shape}")
++        norm = float(np.linalg.norm(embedding))
++        if norm <= np.finfo(np.float32).eps:
++            raise ValueError("FastReID predictor returned a zero vector")
++        return (embedding / norm).astype(np.float32, copy=False)
++
++    def encode(self, frame: FrameData, bbox: np.ndarray) -> np.ndarray | None:
++        """Crop ``bbox`` from a FrameData image and return its embedding."""
++
++        if frame.image is None:
++            return None
++        image = self._validate_image(frame.image)
++        clipped = self._clip_bbox(bbox, image.shape[1], image.shape[0])
++        if clipped is None:
++            return None
++        left, top, right, bottom = clipped
++        return self.encode_crop(image[top:bottom, left:right])
+diff --git a/src/robot_perception/reid/gallery.py b/src/robot_perception/reid/gallery.py
+new file mode 100644
+index 0000000..13bca17
+--- /dev/null
++++ b/src/robot_perception/reid/gallery.py
+@@ -0,0 +1,100 @@
++"""Persistent appearance gallery for long-gap identity reactivation."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import numpy as np
++
++
++@dataclass(frozen=True)
++class GalleryMatch:
++    track_id: int
++    class_id: int
++    similarity: float
++    age_frames: int
++
++
++@dataclass
++class _GalleryEntry:
++    track_id: int
++    class_id: int
++    embedding: np.ndarray
++    last_seen_frame: int
++    updates: int = 1
++    last_score: float = 1.0
++
++
++class AppearanceGallery:
++    """Store EMA-smoothed embeddings independently of active Track objects."""
++
++    def __init__(self, *, momentum: float = 0.9, max_age_frames: int = 300) -> None:
++        if not 0.0 <= momentum < 1.0 or not np.isfinite(momentum):
++            raise ValueError("momentum must be finite and in [0, 1)")
++        if max_age_frames < 1:
++            raise ValueError("max_age_frames must be positive")
++        self.momentum = float(momentum)
++        self.max_age_frames = int(max_age_frames)
++        self._entries: dict[int, _GalleryEntry] = {}
++
++    @staticmethod
++    def _embedding(value: np.ndarray) -> np.ndarray:
++        embedding = np.asarray(value, dtype=np.float32)
++        if embedding.ndim != 1 or embedding.size == 0 or not np.isfinite(embedding).all():
++            raise ValueError("embedding must be a finite non-empty vector")
++        norm = float(np.linalg.norm(embedding))
++        if norm <= np.finfo(np.float32).eps:
++            raise ValueError("embedding must not be zero")
++        return embedding / norm
++
++    def update(self, track_id: int, class_id: int, embedding: np.ndarray, frame_id: int, *, score: float = 1.0) -> None:
++        if track_id < 0 or class_id <= 0 or frame_id < 0:
++            raise ValueError("track_id, class_id, and frame_id must be non-negative/positive")
++        if not np.isfinite(score) or not 0.0 <= score <= 1.0:
++            raise ValueError("score must be finite and in [0, 1]")
++        vector = self._embedding(embedding)
++        entry = self._entries.get(int(track_id))
++        if entry is None or entry.class_id != int(class_id) or entry.embedding.shape != vector.shape:
++            self._entries[int(track_id)] = _GalleryEntry(int(track_id), int(class_id), vector.copy(), int(frame_id), 1, float(score))
++            return
++        blended = self.momentum * entry.embedding + (1.0 - self.momentum) * vector
++        entry.embedding = self._embedding(blended)
++        entry.last_seen_frame = int(frame_id)
++        entry.updates += 1
++        entry.last_score = float(score)
++
++    def purge(self, frame_id: int) -> None:
++        if frame_id < 0:
++            raise ValueError("frame_id must be non-negative")
++        expired = [track_id for track_id, entry in self._entries.items() if frame_id - entry.last_seen_frame > self.max_age_frames]
++        for track_id in expired:
++            del self._entries[track_id]
++
++    def match(
++        self,
++        embedding: np.ndarray,
++        *,
++        class_id: int,
++        frame_id: int,
++        min_similarity: float,
++        min_gap_frames: int = 1,
++        excluded_track_ids: set[int] | frozenset[int] = frozenset(),
++    ) -> GalleryMatch | None:
++        if not 0.0 <= min_similarity <= 1.0 or not np.isfinite(min_similarity):
++            raise ValueError("min_similarity must be finite and in [0, 1]")
++        if min_gap_frames < 1:
++            raise ValueError("min_gap_frames must be positive")
++        vector = self._embedding(embedding)
++        self.purge(frame_id)
++        candidates: list[GalleryMatch] = []
++        for track_id, entry in self._entries.items():
++            age = int(frame_id - entry.last_seen_frame)
++            if entry.class_id != int(class_id) or track_id in excluded_track_ids or age < min_gap_frames:
++                continue
++            similarity = float(np.dot(vector, entry.embedding))
++            if similarity >= min_similarity:
++                candidates.append(GalleryMatch(track_id, entry.class_id, similarity, age))
++        return max(candidates, key=lambda item: item.similarity) if candidates else None
++
++    def __len__(self) -> int:
++        return len(self._entries)
+diff --git a/src/robot_perception/reid/manager.py b/src/robot_perception/reid/manager.py
+new file mode 100644
+index 0000000..4c70cf6
+--- /dev/null
++++ b/src/robot_perception/reid/manager.py
+@@ -0,0 +1,98 @@
++"""Gated identity recovery on top of a 3D Tracker's public IDs."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import numpy as np
++
++from robot_perception.reid.gallery import AppearanceGallery, GalleryMatch
++
++
++@dataclass(frozen=True)
++class ReIDMatchDecision:
++    internal_track_id: int
++    public_track_id: int
++    similarity: float | None
++    reactivated: bool
++
++
++class ReIDIdentityManager:
++    """Map internal 3D track IDs to stable public IDs using FastReID features.
++
++    This wrapper does not mutate ``MultiObjectTracker``. It aliases a newly
++    created internal track to an expired public identity only after motion/2D-3D
++    association has supplied a reliable image crop. Thus Tracker remains fully
++    ROS/Detector/ReID independent.
++    """
++
++    def __init__(
++        self,
++        encoder: object,
++        *,
++        gallery: AppearanceGallery | None = None,
++        similarity_threshold: float = 0.75,
++        min_gap_frames: int = 10,
++        min_fusion_confidence: float = 0.5,
++    ) -> None:
++        if not 0.0 <= similarity_threshold <= 1.0 or not np.isfinite(similarity_threshold):
++            raise ValueError("similarity_threshold must be finite and in [0, 1]")
++        if min_gap_frames < 1:
++            raise ValueError("min_gap_frames must be positive")
++        if not 0.0 <= min_fusion_confidence <= 1.0 or not np.isfinite(min_fusion_confidence):
++            raise ValueError("min_fusion_confidence must be finite and in [0, 1]")
++        self.encoder = encoder
++        self.gallery = gallery or AppearanceGallery()
++        self.similarity_threshold = float(similarity_threshold)
++        self.min_gap_frames = int(min_gap_frames)
++        self.min_fusion_confidence = float(min_fusion_confidence)
++        self._internal_to_public: dict[int, int] = {}
++
++    def public_id(self, internal_track_id: int) -> int:
++        return int(self._internal_to_public.get(int(internal_track_id), int(internal_track_id)))
++
++    def resolve(
++        self,
++        *,
++        internal_track_id: int,
++        class_id: int,
++        frame_id: int,
++        frame: object,
++        bbox: np.ndarray,
++        fusion_confidence: float,
++        active_public_ids: set[int] | frozenset[int],
++        detection_score: float = 1.0,
++    ) -> ReIDMatchDecision:
++        """Update gallery for an existing track or attempt gated reactivation."""
++
++        if not 0.0 <= fusion_confidence <= 1.0 or not np.isfinite(fusion_confidence):
++            raise ValueError("fusion_confidence must be finite and in [0, 1]")
++        embedding = self.encoder.encode(frame, bbox)
++        if embedding is None or fusion_confidence < self.min_fusion_confidence:
++            public = self.public_id(internal_track_id)
++            return ReIDMatchDecision(int(internal_track_id), public, None, False)
++
++        existing_public = self._internal_to_public.get(int(internal_track_id))
++        if existing_public is not None:
++            self.gallery.update(existing_public, class_id, embedding, frame_id, score=detection_score)
++            return ReIDMatchDecision(int(internal_track_id), existing_public, None, False)
++
++        match: GalleryMatch | None = self.gallery.match(
++            embedding,
++            class_id=class_id,
++            frame_id=frame_id,
++            min_similarity=self.similarity_threshold,
++            min_gap_frames=self.min_gap_frames,
++            excluded_track_ids=set(active_public_ids) | {int(internal_track_id)},
++        )
++        public = int(match.track_id) if match is not None else int(internal_track_id)
++        self._internal_to_public[int(internal_track_id)] = public
++        self.gallery.update(public, class_id, embedding, frame_id, score=detection_score)
++        return ReIDMatchDecision(int(internal_track_id), public, None if match is None else match.similarity, match is not None)
++
++    def remove_deleted(self, active_internal_ids: set[int] | frozenset[int]) -> None:
++        """Drop aliases for deleted internal tracks; gallery remains dormant."""
++
++        for internal_id in list(self._internal_to_public):
++            if internal_id not in active_internal_ids:
++                del self._internal_to_public[internal_id]
+diff --git a/tests/test_reid.py b/tests/test_reid.py
+new file mode 100644
+index 0000000..ca78414
+--- /dev/null
++++ b/tests/test_reid.py
+@@ -0,0 +1,77 @@
++"""Tests for FastReID adapter preprocessing and gated identity gallery."""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from robot_perception.common.types import FrameData
++from robot_perception.reid import AppearanceGallery, FastReIDEncoder, ReIDIdentityManager
++
++
++class _FakePredictor:
++    def __init__(self) -> None:
++        self.input = None
++
++    def __call__(self, tensor):
++        self.input = tensor
++        return np.asarray([[3.0, 4.0]], dtype=np.float32)
++
++
++def _frame() -> FrameData:
++    image = np.zeros((100, 200, 3), dtype=np.uint8)
++    image[:, :, 0] = 10
++    return FrameData("0000", 0, image, np.empty((0, 4)), None)
++
++
++def test_fastreid_encoder_crops_and_normalizes_without_importing_fastreid() -> None:
++    predictor = _FakePredictor()
++    encoder = FastReIDEncoder("unused.yml", "unused.pth", predictor=predictor)
++
++    embedding = encoder.encode(_frame(), np.asarray((50.0, 10.0, 150.0, 90.0)))
++
++    assert embedding is not None
++    np.testing.assert_allclose(embedding, (0.6, 0.8), atol=1e-6)
++    assert tuple(predictor.input.shape) == (1, 3, 256, 256)
++
++
++def test_gallery_match_requires_gap_and_similarity() -> None:
++    gallery = AppearanceGallery(momentum=0.0, max_age_frames=100)
++    gallery.update(7, 1, np.asarray((1.0, 0.0)), 0)
++
++    assert gallery.match(np.asarray((1.0, 0.0)), class_id=1, frame_id=5, min_similarity=0.9, min_gap_frames=10) is None
++    match = gallery.match(np.asarray((1.0, 0.0)), class_id=1, frame_id=10, min_similarity=0.9, min_gap_frames=10)
++    assert match is not None and match.track_id == 7
++
++
++def test_reid_manager_reactivates_only_after_reliable_embedding() -> None:
++    predictor = _FakePredictor()
++    manager = ReIDIdentityManager(
++        FastReIDEncoder("unused.yml", "unused.pth", predictor=predictor),
++        similarity_threshold=0.99,
++        min_gap_frames=3,
++        min_fusion_confidence=0.5,
++    )
++    frame = _frame()
++    first = manager.resolve(
++        internal_track_id=1, class_id=1, frame_id=0, frame=frame,
++        bbox=np.asarray((50.0, 10.0, 150.0, 90.0)), fusion_confidence=0.9,
++        active_public_ids=set(),
++    )
++    assert first.public_track_id == 1 and not first.reactivated
++    recovered = manager.resolve(
++        internal_track_id=9, class_id=1, frame_id=3, frame=frame,
++        bbox=np.asarray((50.0, 10.0, 150.0, 90.0)), fusion_confidence=0.9,
++        active_public_ids=set(),
++    )
++    assert recovered.public_track_id == 1
++    assert recovered.reactivated
++
++
++def test_reid_manager_does_not_reactivate_active_identity() -> None:
++    predictor = _FakePredictor()
++    manager = ReIDIdentityManager(FastReIDEncoder("unused.yml", "unused.pth", predictor=predictor), min_gap_frames=1)
++    frame = _frame()
++    manager.resolve(internal_track_id=1, class_id=1, frame_id=0, frame=frame, bbox=np.asarray((1, 1, 50, 50)), fusion_confidence=1.0, active_public_ids=set())
++    decision = manager.resolve(internal_track_id=9, class_id=1, frame_id=5, frame=frame, bbox=np.asarray((1, 1, 50, 50)), fusion_confidence=1.0, active_public_ids={1})
++    assert decision.public_track_id == 9
+diff --git a/weights/README.md b/weights/README.md
+new file mode 100644
+index 0000000..588a44e
+--- /dev/null
++++ b/weights/README.md
+@@ -0,0 +1,532 @@
++# robot-perception-mot
++
++面向 KITTI Tracking 的 Camera-LiDAR 3D 感知与多目标跟踪工程。项目将数据读取、
++点云预处理、坐标变换、检测适配、状态估计、数据关联、轨迹生命周期、跨模态一致性
++检查、离线可视化和 ROS2 replay 保持为职责明确的模块。
++
++
++## 1. Project Overview
++
++系统以 KITTI Tracking 的图像、Velodyne 点云、标定和标签为输入，提供：
++
++- KITTI Tracking 的标准目录与分拆下载目录读取；
++- ROI、Voxel、离群点过滤与 RANSAC 地面分割；
++- KITTI 标定解析及向量化 LiDAR -> Camera -> Rectified Camera -> Image 投影；
++- 独立实现的 3D Constant Velocity Kalman Filter；
++- Mahalanobis gating、Hungarian assignment 与 Track 生命周期；
++- GT/NoisyGT/PointPillars 输出适配，以及实验性 Camera-LiDAR object-level fusion；
++- 可复现的 baseline benchmark、深度着色可视化、MP4 和 ROS2 Humble replay。
++
++## 2. Motivation
++
++机器人感知工程的难点不只在单个模型，而在传感器数据、坐标系、时间序列状态和
++可观测结果之间建立可靠边界。本项目使用成熟的 KITTI 数据和公开 PointPillars 权重，
++将重点放在可测试的 3D tracking 与多传感器几何流程上。
++
++## 3. System Architecture
++
++```mermaid
++flowchart LR
++    K[KITTI Tracking] --> D[Dataset Loader]
++    D --> I[Camera Image]
++    D --> P[Raw LiDAR N x 4]
++    D --> C[Calibration P2/R0_rect/Tr_velo_to_cam]
++    P --> PP[Point Cloud Preprocess]
++    P --> DET[3D Detector Adapter]
++    DET --> T[ROS-independent MOT Core]
++    T --> TS[TrackState]
++    C --> PROJ[3D-to-2D Projection]
++    DET --> PROJ
++    I --> CAM[Camera 2D Detection]
++    PROJ --> ASSOC[Cross-modal Association]
++    CAM --> ASSOC
++    ASSOC --> F[Object-level FusedDetection]
++    P --> V[Depth-coloured Visualization]
++    PP --> V
++    T --> R[ROS2 Adapter / RViz]
++```
++
++模块之间通过 `FrameData`、`Detection3D`、`TrackState` 等 dataclass 通信。
++Tracker 不导入 `rclpy`，也不依赖具体 Detector。
++
++端到端执行顺序如下；benchmark 的三个 tracker 分支共享同一 detection stream：
++
++```mermaid
++flowchart TD
++    A[FrameData: image + raw LiDAR + labels] --> B[Preprocess / optional]
++    A --> C[Detector Adapter]
++    C --> D{Tracking method}
++    D --> D1[Baseline NN]
++    D --> D2[KF + Euclidean]
++    D --> D3[KF + Mahalanobis + Hungarian]
++    D1 --> E[TrackState]
++    D2 --> E
++    D3 --> E
++    A --> F[Calibration Projection]
++    F --> G[Camera 2D Association]
++    G --> H[FusedDetection]
++    E --> I[Metrics / ROS2 / Visualization]
++    H --> I
++```
++
++## 4. Dataset
++
++主数据集为 [KITTI Tracking](https://www.cvlibs.net/datasets/kitti/eval_tracking.php)，
++使用 `image_02`、`velodyne`、`calib`、`label_02`。当前默认配置位于
++`configs/dataset.yaml`，开发与已运行实验使用 sequence `0000`；配置也列出 `0001`
++和 `0002` 供后续扩展。
++
++- `FrameData.image`：OpenCV BGR 图像；
++- `FrameData.lidar_points`：`float32`，形状为 `N x 4`，列为 `[x, y, z, intensity]`；
++- KITTI Tracking 标签保留 `sequence_id`、`frame_id`、`track_id`、类别、2D bbox、
++  尺寸、位置与 `rotation_y`；
++- KITTI label 位置和 3D box 在 camera 坐标系，PointPillars 输出在 LiDAR 坐标系。
++
++## 5. Environment
++
++目标环境为 Ubuntu 22.04、ROS2 Humble、Python 3.10、PyTorch 2.1.2+cu118、
++CUDA 11.8。主项目与旧版 MMDetection3D PointPillars 使用**两套隔离环境**，
++不能混装。
++
++主项目已使用的核心版本：
++
++```text
++conda env: robot-perception-mot
++Python:    3.10
++PyTorch:   2.1.2+cu118
++NumPy:     1.26.4
++SciPy:     1.11.4
++ROS2:      Humble
++```
++
++## 6. Installation
++
++从仓库根目录执行。先让 shell 可使用 conda：
++
++```bash
++source "$(conda info --base)/etc/profile.d/conda.sh"
++conda create -n robot-perception-mot python=3.10 -y
++conda activate robot-perception-mot
++
++pip install torch==2.1.2 torchvision==0.16.2 \
++  --index-url https://download.pytorch.org/whl/cu118
++pip install numpy==1.26.4 scipy==1.11.4 opencv-python open3d pyyaml \
++  tqdm matplotlib scikit-learn filterpy lap motmetrics pytest
++```
++
++项目采用 `src/` 布局；仓库内脚本会从根目录定位 `src/robot_perception`，无需额外
++安装主包。验证基础环境：
++
++```bash
++conda run -n robot-perception-mot python -m pytest tests/
++```
++
++## 7. Dataset Preparation
++
++下载 KITTI Tracking 的 image、velodyne、calib 与 label 压缩包，解压到 `data/`。
++Loader 兼容以下任一布局，数据和权重均被 Git 忽略：
++
++```text
++# 当前本地分拆下载布局
++data/
++├── data_tracking_image_2/training/image_02/0000/000100.png
++├── data_tracking_velodyne/training/velodyne/0000/000100.bin
++├── data_tracking_calib/training/calib/0000.txt
++└── data_tracking_label_2/training/label_02/0000.txt
++
++# 也兼容标准布局
++data/training/{image_02,velodyne,calib,label_02}/
++```
++
++修改 `configs/dataset.yaml` 中的相对 `dataset.root` 即可切换数据位置；不要把绝对
++数据路径、KITTI 数据或模型权重提交到 Git。
++
++## 8. Quick Start
++
++激活 `robot-perception-mot` 后，在仓库根目录依次运行：
++
++
++```bash
++# 读取一帧并检查图像、点云和标签
++python scripts/inspect_kitti.py --sequence 0000 --frame 100
++
++# 执行完整点云预处理并打印各阶段点数
++python scripts/run_pointcloud_preprocess.py --sequence 0000 --frame 100
++
++# 输出 raw/non-ground 深度着色 fusion 图
++python scripts/run_fusion_demo.py --sequence 0000 --frame 100
++
++# 运行同一输入下的三种 MOT baseline，生成 JSON、图表和实验报告
++python scripts/evaluate.py --config configs/pipeline.yaml --sequence 0000
++
++# 运行单元测试
++python -m pytest tests/
++```
++
++`evaluate.py` 默认处理 sequence `0000` 的整个配置帧范围。真实 PointPillars 推理和
++ROS2 replay 的独立环境要求见后文。
++
++## 9. Point Cloud Pipeline
++
++```mermaid
++flowchart LR
++    RAW[Raw N x 4] --> INV[NaN/Inf filtering]
++    INV --> ROI[ROI crop]
++    ROI --> VOX[Voxel downsample]
++    VOX --> OUT[Statistical or radius outlier filter]
++    OUT --> GND[RANSAC ground segmentation]
++    GND --> GP[ground_points]
++    GND --> NGP[non_ground_points]
++```
++
++实现位于 `src/robot_perception/pointcloud/`。ROI、体素大小、离群点和 RANSAC 参数
++全部来自 `configs/pipeline.yaml`。`preprocess_point_cloud()` 会保留 raw、valid、ROI、
++voxel、outlier、ground 与 non-ground 各阶段数组及 shape，空点云安全返回。
++
++## 10. Calibration
++
++`dataset/calibration.py` 解析 KITTI `P2`、`R0_rect`、`Tr_velo_to_cam`；
++`common/geometry.py` 使用 NumPy 向量化实现：
++
++```text
++LiDAR xyz --Tr_velo_to_cam--> Camera
++           --R0_rect-------> Rectified Camera
++           --P2------------> Image pixel (u, v)
++```
++
++投影会显式使用 homogeneous coordinate，并过滤 NaN/Inf、相机后方点与图像 FOV 外点。
++这一步是**几何 projection**，不是 sensor fusion。
++
++## 11. Detection
++
++`BaseDetector.predict(frame) -> list[Detection3D]` 是 Tracker 的唯一 Detector 边界。
++
++- `GTDetector`、`NoisyGTDetector`：将 KITTI 标签标准化为 `Detection3D`；只可用于
++  tracking pipeline validation；
++- `MMDet3DPointPillarsAdapter`：将 MMDetection3D `boxes_3d`、`scores_3d`、
++  `labels_3d` 映射为统一输出；官方三类映射为 Pedestrian -> 2、Cyclist -> 3、Car -> 1；
++- `Detection3D`：统一为 `position`、`dimensions`、`yaw`、`score`、`class_id`。
++
++### Real detector experiment
++
++本地已完成官方 PointPillars KITTI checkpoint 的单帧和 `0000` 全序列端到端接入验证。
++YOLO26 2D detector 使用 KITTI 三类标签微调后导出 ONNX，由主项目环境的 OpenCV DNN
++加载；PointPillars 3D detector 保持在独立的 `mmdet3d-kitti` 环境。
++
++旧版 PointPillars 必须使用独立环境，避免破坏主项目：
++
++```bash
++source "$(conda info --base)/etc/profile.d/conda.sh"
++conda create -n mmdet3d-kitti python=3.8 -y
++conda activate mmdet3d-kitti
++
++# 网络较慢时可临时设置代理，完成后执行 unset。
++export HTTP_PROXY=http://192.168.109.107:7890
++export HTTPS_PROXY=http://192.168.109.107:7890
++
++pip install torch==1.10.0+cu113 torchvision==0.11.1+cu113 \
++  --extra-index-url https://download.pytorch.org/whl/cu113
++pip install numpy==1.20.3 Pillow==9.5.0
++pip install mmcv-full==1.6.0 \
++  -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10/index.html
++pip install mmdet==2.28.2 mmsegmentation==0.30.0
++git clone --branch v1.0.0rc6 --depth 1 \
++  https://github.com/open-mmlab/mmdetection3d.git mmdetection3d-1.0
++pip install -v -e ./mmdetection3d-1.0
++
++unset HTTP_PROXY HTTPS_PROXY
++```
++
++版本组合必须保持：Python 3.8、PyTorch 1.10.0+cu113、MMCV 1.6.0、
++MMDetection 2.28.2、MMDetection3D 1.0.0rc6、NumPy 1.20.3、Pillow 9.5.0。
++
++YOLO26 的训练和 ONNX 导出使用从主环境继承依赖的临时 venv，不向
++`robot-perception-mot` 安装 Ultralytics：
++
++```bash
++python -m venv --system-site-packages /tmp/robot-perception-mot-yolo26
++/tmp/robot-perception-mot-yolo26/bin/python -m pip install \
++  ultralytics==8.4.131 onnx==1.16.0
++```
++
++统一权重目录为 `weights/`，包含原始 `yolo26s.pt`、训练后的
++`yolo26s_kitti3class.pt`/`.onnx` 和 PointPillars `.pth`；这些大文件均被 Git 忽略。
++
++官方配置和三分类 checkpoint（`Pedestrian/Cyclist/Car`）下载地址：
++
++```text
++https://download.openmmlab.com/mmdetection3d/v1.0.0_models/pointpillars/
++hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class/
++hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth
++```
++
++将配置放在 `mmdetection3d-1.0/configs/pointpillars/`，checkpoint 放在仓库根目录，
++或修改 `configs/detector.yaml` 的 `real.config` 与 `real.checkpoint`。运行前检查：
++
++```bash
++nvidia-smi
++test -f mmdetection3d-1.0/configs/pointpillars/hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class.py
++test -f hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth
++python -c "import torch,mmcv,mmdet,mmdet3d,numpy,PIL; print(torch.__version__, torch.version.cuda, mmcv.__version__, mmdet.__version__, mmdet3d.__version__, numpy.__version__, PIL.__version__)"
++```
++
++在 `mmdet3d-kitti` 环境中，可先运行官方单帧 demo：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 python mmdetection3d-1.0/demo/pcd_demo.py \
++  data/data_tracking_velodyne/training/velodyne/0000/000100.bin \
++  mmdetection3d-1.0/configs/pointpillars/hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class.py \
++  hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth \
++  --device cuda:0 --score-thr 0.3 --out-dir /tmp/pointpillars_demo
++```
++
++再将 checkpoint 路径配置到 `configs/detector.yaml` 后，可运行项目 adapter：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 python scripts/run_detection.py \
++  --detector real --sequence 0000 --frame 100
++```
++
++### YOLO26 KITTI 三类训练与 ONNX
++
++`yolo26s.pt` 是 COCO 预训练模型，先由 `scripts/prepare_kitti_yolo.py` 将 KITTI
++`label_02` 转成 YOLO 格式，再在临时环境训练三类 head。当前已生成 8,008 帧、45,198
++个框的训练集（17 个 train sequence、4 个 val sequence，图像使用符号链接）：
++
++```bash
++python scripts/prepare_kitti_yolo.py --output data/yolo26_kitti_trainset
++/tmp/robot-perception-mot-yolo26/bin/python scripts/train_yolo26_kitti.py \
++  --epochs 10 --device 0
++/tmp/robot-perception-mot-yolo26/bin/python scripts/export_yolo26_onnx.py
++```
++
++训练配置位于 `configs/yolo26_train.yaml`，数据类别顺序固定为：`Car`、`Pedestrian`、
++`Cyclist`。本次 10 epoch 实际验证结果为 Precision `0.62777`、Recall `0.53965`、
++mAP50 `0.53000`、mAP50-95 `0.32233`；这是 2D detector 验证结果，不等同于 MOT 指标。
++
++另外提供严格 hold-out 配置 `configs/yolo26_kitti_holdout.yaml`：sequence `0000` 的
++154 帧完全不进入训练，只用于验证。当前 hold-out 训练已完成 10 epochs，验证结果
++为 Precision `0.55334`、Recall `0.50818`、mAP50 `0.43773`、mAP50-95 `0.30819`；
++该权重和 ONNX 位于 `weights/yolo26s_kitti3class_holdout0000.*`，可用
++`scripts/run_end_to_end.py --camera-model ...holdout0000.onnx` 做无训练序列泄漏的 replay smoke。
++
++## 12. Kalman Filter
++
++`ConstantVelocityKalmanFilter` 独立实现下列线性模型，不依赖 filterpy 的核心数学：
++
++```text
++x = [px, py, pz, vx, vy, vz]^T
++z = [px, py, pz]^T
++x_k = F(dt) x_(k-1) + w
++z_k = H x_k + v
++```
++
++支持可变 `dt`、可配置 Q/R/P，更新采用 Joseph covariance form，输入与矩阵 shape
++均有 NaN/Inf 检查。合成轨迹实验的实际输出保存在
++`outputs/metrics/kalman_baseline.json`：原始测量 RMSE `0.465834`，Kalman filtered
++RMSE `0.370640`。
++
++## 13. Data Association
++
++Proposed 关联步骤为 Prediction -> Mahalanobis distance -> gating -> Hungarian：
++
++```text
++d^2 = y^T S^-1 y
++```
++
++实现使用线性方程求解，避免显式求逆；无效 pair 不会被 Hungarian 的哨兵成本误配。
++同时保留 Euclidean nearest-neighbor，作为 benchmark 的对照方法。空 track、空
++detection、数量不等和全 pair 无效均有单元测试。
++
++## 14. Multi-Object Tracking
++
++`MultiObjectTracker` 接收 `Detection3D`，执行：
++
++```text
++Predict -> Gate/Associate -> Update -> Birth -> Age -> Delete
++```
++
++每个 Track 保存递增且不复用的 `track_id`、KF state/covariance、age、hits、
++`time_since_update` 与状态。生命周期为 `Tentative -> Confirmed -> Lost -> Deleted`；
++`min_hits`、`max_age` 和 gating threshold 由配置控制。
++
++合成漏检轨迹的实际输出位于 `outputs/metrics/tracker_baseline.json`：80 帧、3 个目标、
++measurement std `0.35`、miss probability `0.15` 条件下，MOTA `0.770833`、
++IDF1 `0.896552`、IDS `10`。这是合成 tracker demo，不是 KITTI Detector 性能。
++
++## 15. Camera-LiDAR Fusion
++
++以下三个概念必须区分：
++
++1. **Camera-LiDAR projection**：把 LiDAR 3D box corners 或点投影到图像；仅是坐标
++   变换和可见性过滤。
++2. **Cross-modal association**：比较投影 2D box 与 Camera 2D detection 的类别、IoU
++   和中心距离，进行一对一匹配。
++3. **Camera-LiDAR sensor fusion**：仅对匹配对象生成 `FusedDetection`，保留
++   `lidar_detection`、`camera_detection`、`projected_bbox`、`fusion_confidence` 与
++   可选 `track_id`。
++
++当前 Camera 侧是 `SyntheticCameraDetector`，它把 KITTI 2D 标签作为 mock 输入，
++只用于流程验证；不能据此宣称已经完成真实 Camera detector 或学习式融合。
++
++## 16. ROS2
++
++`ros2_ws/src/perception_tracker` 提供 replay-oriented ROS2 Humble package：
++
++```text
++/sensors/lidar/points   sensor_msgs/PointCloud2
++/sensors/camera/image   sensor_msgs/Image
++/perception/detections  visualization_msgs/MarkerArray
++/perception/tracks      visualization_msgs/MarkerArray
++```
++
++节点使用 Header 的当前 replay timestamp 与 `lidar`/`camera` frame；`base_link`、
++`lidar`、`camera` 的真实变换由外部 TF2 tree 提供，不使用硬编码外参替代 TF。
++
++```bash
++source /opt/ros/humble/setup.bash
++colcon build --symlink-install --base-paths ros2_ws
++source install/setup.bash
++
++ros2 launch perception_tracker perception_tracker.launch.py \
++  dataset_root:=data sequence:=0000 start_frame:=100 end_frame:=100 \
++  replay_rate:=1.0
++```
++
++安装 RViz2 后可追加 `use_rviz:=true`。GT/NoisyGT replay 的 detection 位于 camera
++frame；LiDAR Detector 输出必须显式设置 `detection_frame:=lidar`。
++
++### 真实端到端 replay
++
++在 `mmdet3d-kitti` 环境中运行统一脚本，PointPillars 生成 LiDAR 3D box，YOLO26 ONNX
++生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/run_end_to_end.py --sequence 0000 --device cuda:0
++```
++
++最近一次真实运行处理 154 帧：PointPillars 输出 1,594 个 3D detections，YOLO26 输出
++727 个 2D detections，确认轨迹 1,214 个，融合结果 482 个；端到端耗时 16.49 秒，
++约 9.34 FPS，平均单帧 94.18 ms（包含两侧 detector、Tracker、projection、fusion
++和视频写入）。运行统计完整保存在 `outputs/metrics/end_to_end_0000.json`。
++
++这里的“端到端”指真实 detector 到融合输出的完整 replay：PointPillars 使用 KITTI
++原始 `.bin`（不额外做会改变其训练分布的 ground removal），YOLO26 使用 KITTI 三类
++相机图像，Tracker 只消费 PointPillars 的 `Detection3D`，最后使用 calibration 将
++LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
++但没有偷偷插入真实 PointPillars 推理链。
++
++## 17. Benchmark
++
++运行：
++
++```bash
++python scripts/evaluate.py --config configs/pipeline.yaml --sequence 0000
++```
++
++该命令根据 `configs/pipeline.yaml` 预计算一次 detection stream，再让三种方法在
++相同 dataset、sequence、帧范围与输入上分别运行：
++
++| Method | Tracking pipeline |
++| --- | --- |
++| `baseline_nn` | Detection -> Euclidean nearest-neighbor，无 Kalman |
++| `baseline_kf` | Detection -> Kalman -> Euclidean association |
++| `proposed` | Detection -> Kalman -> Mahalanobis gating -> Hungarian |
++
++输出 `outputs/metrics/baseline_nn.json`、`baseline_kf.json`、`proposed.json`、
++`mot_comparison.png` 与 [实验报告](docs/experiments.md)。每个 JSON 保存 Git hash、
++完整配置、sequence、帧范围、timestamp、MOTA、IDF1、IDS、FP、FN、CPU peak RSS、
++FPS 与 latency；GT input 的 GPU memory 明确写为 `NOT RUN`。
++
++真实 PointPillars 驱动的 MOT 评估使用：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/evaluate_real_mot.py --sequence 0000 --device cuda:0
++```
++
++该脚本将 KITTI camera GT box center 通过 calibration 转到 LiDAR 坐标，再与真实
++PointPillars -> Tracker 输出匹配；结果写入 `outputs/metrics/real_pointpillars_mot.json`。
++这和 GTDetector benchmark 是两个不同实验。
++
++## 18. Results
++
++下表直接整理自当前 `outputs/metrics/*.json`。实验配置为 KITTI Tracking `0000`、
++frame `0..153`、154 帧、711 个 GT object、`detector_type: gt`；三种方法使用同一
++GT detection input。最近一次运行的 CPU peak RSS 为 `62.94 MB`，GPU memory 为 `NOT RUN`。
++
++| Method | MOTA | IDF1 | IDS | FP | FN | FPS | latency/frame (ms) |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
++| baseline_nn | 1.0000 | 1.0000 | 0 | 0 | 0 | 6701.92 | 0.149 |
++| baseline_kf | 1.0000 | 1.0000 | 0 | 0 | 0 | 1094.63 | 0.914 |
++| proposed | 1.0000 | 1.0000 | 0 | 0 | 0 | 1034.87 | 0.966 |
++
++这些数值是 **GT-based tracking validation**：GT detector 没有漏检或定位噪声，
++因此三种方法在此输入上都达到 1.0。它们只证明 benchmark、association 和 tracking
++链路可复现，**不能**用于比较真实 Detector、PointPillars 或端到端系统的性能。
++
++真实 PointPillars `0000` 全序列评估结果为：GT `711`、matches `448`、FP `766`、
++FN `263`、IDS `8`、MOTA `-0.4585`、IDF1 `0.4655`、FPS `25.10`。负 MOTA 表示
++当前预训练 detector 的误检/漏检数量已经超过 GT 数量；它是实际 detector-driven
++结果，不应被隐藏或替换成 GT benchmark 的 1.0。
++
++![MOT baseline comparison](outputs/metrics/mot_comparison.png)
++
++## 19. Visualization
++
++`configs/fusion.yaml` 中 `visualization.lidar_points_mode` 支持：
++
++- `raw`：直接投影 `FrameData.lidar_points`，用于 calibration debug；
++- `non_ground`：投影完整点云预处理后的 `non_ground_points`，用于最终感知/融合 demo；
++- `none`：只显示 object-level fusion boxes。
++
++点颜色来自 rectified camera depth 的 TURBO 色表，而非固定绿色。每次单帧 demo 都
++输出同一帧 raw 与 non-ground 图供人工比较；绿色框为 LiDAR 3D box 的 2D 投影，
++蓝色框为 Camera 2D detection。
++
++![sequence 0000 frame 100 non-ground fusion visualization](outputs/visualizations/fusion_0000_000100_non_ground.png)
++
++完整 sequence `0000` 的 non-ground 离线视频由 `cv2.VideoWriter` 生成：
++
++```bash
++python scripts/render_fusion_video.py --sequence 0000
++```
++
++[打开 MP4 视频](outputs/videos/fusion_0000_non_ground.mp4)。可用
++`--lidar-points-mode raw` 生成 calibration debug 视频，或以 `--start-frame`、
++`--end-frame`、`--fps` 调整范围。
++
++## 20. Limitations
++
++- MOT benchmark 的三个 baseline 仍使用 GT/NoisyGT 输入；它们验证 tracking/association，
++  不代表真实 detector 性能。PointPillars + YOLO26 全序列 replay 已可运行，但尚未计算
++  标准 detector mAP/recall；真实 PointPillars 驱动的 MOT 指标已记录，但当前结果较弱。
++- `SyntheticCameraDetector` 是实验 mock，Camera-LiDAR fusion 目前是几何投影、
++  跨模态匹配与规则置信度，不是 neural fusion。
++- 当前 IDF1 为基于逐帧位置匹配的可复现 baseline，不替代 MOTChallenge 全局 ID 指标。
++- ROS2 节点为 KITTI replay adapter，不是实时传感器驱动；实际部署需要驱动、TF tree
++  与时间同步。
++- PointPillars 依赖旧版 OpenMMLab 栈，必须在隔离环境运行。
++
++## 21. Future Work
++
++1. 缓存真实 PointPillars + YOLO26 全序列输出，在相同 detection input 下执行端到端 MOT
++   benchmark，并记录 detector runtime/GPU memory。
++2. 增加 YOLO26 训练增强、类别/遮挡分层评估，并替换当前 10 epoch 实验权重为正式模型。
++3. 实现标准 MOTChallenge 全局 IDF1 与更完整的误差分析。
++4. 连接真实 ROS2 传感器 topic、TF tree 和时间同步，执行 RViz2 集成测试。
++5. 在不破坏模块边界的前提下增加类别一致性 gating、检测缓存和性能 profiling。
++
++## Project Layout
++
++```text
++configs/                 YAML 配置
++src/robot_perception/    可复用感知核心包
++ros2_ws/src/             ROS2 replay adapter
++scripts/                 数据检查、demo、benchmark、视频脚本
++tests/                   pytest 单元与 smoke tests
++docs/                    实验报告
++outputs/                 本地生成的 metrics、可视化和视频（不提交）
++data/                    本地 KITTI 数据（不提交）
++```

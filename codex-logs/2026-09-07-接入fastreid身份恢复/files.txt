@@ -1,0 +1,27 @@
+# 变更清单
+
+基线 `1161e3b8da0a2f79e759f7b585bafed3673611b5` → 当前工作区 ｜ 10 个文件，+1722 / -4
+
+```
+22	2	README.md
+64	2	scripts/run_end_to_end.py
+12	0	configs/reid.yaml
+653	0	docs/project_tutorial_zh.md
+13	0	src/robot_perception/reid/__init__.py
+151	0	src/robot_perception/reid/fastreid.py
+100	0	src/robot_perception/reid/gallery.py
+98	0	src/robot_perception/reid/manager.py
+77	0	tests/test_reid.py
+532	0	weights/README.md
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- configs/reid.yaml
+- docs/project_tutorial_zh.md
+- src/robot_perception/reid/__init__.py
+- src/robot_perception/reid/fastreid.py
+- src/robot_perception/reid/gallery.py
+- src/robot_perception/reid/manager.py
+- tests/test_reid.py
+- weights/README.md
