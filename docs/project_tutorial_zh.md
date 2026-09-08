@@ -489,14 +489,38 @@ public ID reactivation：PointPillars 4,687 个 3D 框、YOLO26 3,118 个 2D 框
 真实误检、漏检和定位误差进入后，Tracker 的表现怎样？
 ```
 
-当前真实 PointPillars `0000` 全序列记录：
+当前真实 PointPillars `0000` 全序列的旧版逐帧记录：
 
 ```text
 GT 711, matches 448, FP 766, FN 263, IDS 8
 MOTA -0.4585, IDF1 0.4655, FPS 25.10
 ```
 
-负 MOTA 不是应该隐藏的结果，而是说明真实检测质量和 Tracker 输入质量仍是瓶颈。
+该结果中的 IDF1 是逐帧位置匹配近似，不是全局 identity 指标。负 MOTA 不是应该隐藏的
+结果，而是说明真实检测质量和 Tracker 输入质量仍是瓶颈。
+
+### 12.1 基于 KITTI identity 的标准 MOT 指标
+
+`scripts/evaluate_real_mot.py` 现在使用 KITTI `label_02` 的 `track_id` 作为 GT identity，
+通过全局一对一 identity assignment 计算标准 MOTA、IDF1、IDP、IDR、IDS、FP 和 FN。
+结果文件为：
+
+```text
+outputs/metrics/real_pointpillars_mot_0000_standard.json
+outputs/metrics/real_pointpillars_mot_0001_standard.json
+```
+
+真实结果如下（2 m 三维中心距离阈值）：
+
+```text
+sequence 0000: MOTA -0.4585, IDF1 0.4010, IDP 0.3180, IDR 0.5429, IDS 8, FP 766, FN 263
+sequence 0001: MOTA  0.1700, IDF1 0.6395, IDP 0.5527, IDR 0.7589, IDS 4, FP 1799, FN 682
+```
+
+当前旧版 MMDetection3D 环境没有安装 `motmetrics`，因此本次 JSON 的
+`metric_backend` 为 `scipy_fallback`；该 fallback 使用同样的帧级距离匹配和全局
+Hungarian identity assignment。`0000` 的旧逐帧 IDF1 `0.4655` 仍保留在
+`legacy_framewise`，不能与标准 IDF1 `0.4010` 混用。
 
 ## 13. 常见实践坑
 

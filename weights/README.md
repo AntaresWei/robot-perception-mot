@@ -4,6 +4,8 @@
 点云预处理、坐标变换、检测适配、状态估计、数据关联、轨迹生命周期、跨模态一致性
 检查、离线可视化和 ROS2 replay 保持为职责明确的模块。
 
+> 本项目的目标是展示可验证的工程实现，不训练新的检测网络，也不宣称 SOTA 性能。
+> 所有实验数值均来自本地 `outputs/metrics/` 的实际生成文件。
 
 ## 1. Project Overview
 
@@ -145,6 +147,7 @@ data/training/{image_02,velodyne,calib,label_02}/
 
 激活 `robot-perception-mot` 后，在仓库根目录依次运行：
 
+面向初学者的完整中文教程见：[中文项目教程](docs/project_tutorial_zh.md)。
 
 ```bash
 # 读取一帧并检查图像、点云和标签
@@ -211,7 +214,9 @@ LiDAR xyz --Tr_velo_to_cam--> Camera
 
 本地已完成官方 PointPillars KITTI checkpoint 的单帧和 `0000` 全序列端到端接入验证。
 YOLO26 2D detector 使用 KITTI 三类标签微调后导出 ONNX，由主项目环境的 OpenCV DNN
-加载；PointPillars 3D detector 保持在独立的 `mmdet3d-kitti` 环境。
+加载；PointPillars 3D detector 保持在独立的 `mmdet3d-kitti` 环境。真实 detector 的
+全序列运行统计写入 `outputs/metrics/end_to_end_0000.json`；这不是 detector mAP/recall
+benchmark，后者仍需单独按 KITTI 官方评估协议计算。
 
 旧版 PointPillars 必须使用独立环境，避免破坏主项目：
 
@@ -366,8 +371,9 @@ IDF1 `0.896552`、IDS `10`。这是合成 tracker demo，不是 KITTI Detector �
    `lidar_detection`、`camera_detection`、`projected_bbox`、`fusion_confidence` 与
    可选 `track_id`。
 
-当前 Camera 侧是 `SyntheticCameraDetector`，它把 KITTI 2D 标签作为 mock 输入，
-只用于流程验证；不能据此宣称已经完成真实 Camera detector 或学习式融合。
+单帧 `run_fusion_demo.py` 仍支持 `SyntheticCameraDetector` 作为几何流程 mock；真实
+端到端脚本使用 YOLO26 ONNX Camera detector。FastReID 只作为可选外观身份恢复适配器，
+不把 2D 观测直接写入 3D Kalman state，也不是 neural sensor fusion。
 
 ## 16. ROS2
 
@@ -417,6 +423,30 @@ CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python 
 LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
 但没有偷偷插入真实 PointPillars 推理链。
 
+## FastReID 身份恢复（可选）
+
+FastReID 作为独立的外观特征适配器，不进入 Tracker 的 Kalman 或 Hungarian 核心。
+使用 VehicleID 的 `vehicleid_bot_R50-ibn.pth`：只有在 2D/3D 已可靠匹配且
+`fusion_confidence` 达到阈值时，才把 YOLO26 crop 的 embedding 写入 gallery；长时间
+消失后，新 3D Track 通过类别、间隔和 cosine similarity 查询 gallery，恢复 public ID。
+
+将完整权重放到 `weights/vehicleid_bot_R50-ibn.pth`，并准备 FastReID 源码（例如
+`/tmp/fast-reid`）后运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+  scripts/run_end_to_end.py --sequence 0000 --device cuda:0 \
+  --enable-reid --fastreid-root /tmp/fast-reid
+```
+
+没有完整权重或 FastReID 依赖时，脚本会明确失败，不会生成伪造的 appearance feature。
+
+在不同场景 `0001` 上启用 FastReID 后，完整 443 帧 replay 实际发生 29 次 public ID
+reactivation：PointPillars 4,687 个 3D detections、YOLO26 3,118 个 2D detections、
+确认轨迹 4,111 个、融合结果 2,349 个，端到端 4.36 FPS（101.65 秒）。结果保存为
+`outputs/metrics/end_to_end_0001_reid.json` 和 `outputs/videos/end_to_end_0001_reid.mp4`。
+
 ## 17. Benchmark
 
 运行：
@@ -446,9 +476,22 @@ CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python 
   scripts/evaluate_real_mot.py --sequence 0000 --device cuda:0
 ```
 
-该脚本将 KITTI camera GT box center 通过 calibration 转到 LiDAR 坐标，再与真实
-PointPillars -> Tracker 输出匹配；结果写入 `outputs/metrics/real_pointpillars_mot.json`。
-这和 GTDetector benchmark 是两个不同实验。
+该脚本将 KITTI camera GT box center 通过 calibration 转到 LiDAR 坐标，再以 KITTI
+`label_02` 的 `track_id` 作为 ground-truth identity，与真实 PointPillars -> Tracker
+输出做全局 identity 评估。结果写入 `outputs/metrics/real_pointpillars_mot_<sequence>_standard.json`。
+评估使用 `motmetrics`；旧版 PointPillars 环境未安装该包时，脚本使用等价的 SciPy
+Hungarian fallback，并在 JSON 的 `metric_backend` 中标明。这和 GTDetector benchmark
+是两个不同实验。
+
+```bash
+# 生成 KITTI 0000/0001 的标准 MOTChallenge 指标（当前机器无 NVIDIA 驱动时使用 CPU）
+/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+  scripts/evaluate_real_mot.py --sequence 0000 --device cpu \
+  --output outputs/metrics/real_pointpillars_mot_0000_standard.json
+/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+  scripts/evaluate_real_mot.py --sequence 0001 --device cpu \
+  --output outputs/metrics/real_pointpillars_mot_0001_standard.json
+```
 
 ## 18. Results
 
@@ -466,10 +509,18 @@ GT detection input。最近一次运行的 CPU peak RSS 为 `62.94 MB`，GPU mem
 因此三种方法在此输入上都达到 1.0。它们只证明 benchmark、association 和 tracking
 链路可复现，**不能**用于比较真实 Detector、PointPillars 或端到端系统的性能。
 
-真实 PointPillars `0000` 全序列评估结果为：GT `711`、matches `448`、FP `766`、
-FN `263`、IDS `8`、MOTA `-0.4585`、IDF1 `0.4655`、FPS `25.10`。负 MOTA 表示
-当前预训练 detector 的误检/漏检数量已经超过 GT 数量；它是实际 detector-driven
-结果，不应被隐藏或替换成 GT benchmark 的 1.0。
+真实 PointPillars 的标准 MOTChallenge 全局 identity 评估如下；指标来自
+`outputs/metrics/real_pointpillars_mot_*_standard.json`，匹配距离阈值为 2 m：
+
+| Sequence | Frames | GT | MOTA | IDF1 | IDP | IDR | IDS | FP | FN |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0000 | 154 | 711 | -0.4585 | 0.4010 | 0.3180 | 0.5429 | 8 | 766 | 263 |
+| 0001 | 443 | 2994 | 0.1700 | 0.6395 | 0.5527 | 0.7589 | 4 | 1799 | 682 |
+
+`0000` 的旧逐帧 IDF1 近似值为 `0.4655`，仅保存在 JSON 的
+`legacy_framewise.IDF1` 中；上表使用 KITTI identity 的全局 ID assignment，不能
+与旧值混用。负 MOTA 表示当前预训练 detector 的误检/漏检数量已经超过 GT 数量；
+它是实际 detector-driven 结果，不应被隐藏或替换成 GT benchmark 的 1.0。
 
 ![MOT baseline comparison](outputs/metrics/mot_comparison.png)
 
@@ -504,7 +555,10 @@ python scripts/render_fusion_video.py --sequence 0000
   标准 detector mAP/recall；真实 PointPillars 驱动的 MOT 指标已记录，但当前结果较弱。
 - `SyntheticCameraDetector` 是实验 mock，Camera-LiDAR fusion 目前是几何投影、
   跨模态匹配与规则置信度，不是 neural fusion。
-- 当前 IDF1 为基于逐帧位置匹配的可复现 baseline，不替代 MOTChallenge 全局 ID 指标。
+- 真实 PointPillars 的标准 MOTA/IDF1 已按 KITTI `track_id` 计算；GT/NoisyGT 三方法表中的
+  IDF1 仍是 benchmark 内部的逐帧位置匹配结果，不能与真实 detector 指标混用。
+- 当前无 NVIDIA 驱动的环境使用 SciPy fallback 计算全局 identity assignment；
+  `num_fragmentations` 尚未在 fallback 中统计，标准 MOTA/IDF1/IDP/IDR/IDS/FP/FN 已生成。
 - ROS2 节点为 KITTI replay adapter，不是实时传感器驱动；实际部署需要驱动、TF tree
   与时间同步。
 - PointPillars 依赖旧版 OpenMMLab 栈，必须在隔离环境运行。
@@ -514,7 +568,7 @@ python scripts/render_fusion_video.py --sequence 0000
 1. 缓存真实 PointPillars + YOLO26 全序列输出，在相同 detection input 下执行端到端 MOT
    benchmark，并记录 detector runtime/GPU memory。
 2. 增加 YOLO26 训练增强、类别/遮挡分层评估，并替换当前 10 epoch 实验权重为正式模型。
-3. 实现标准 MOTChallenge 全局 IDF1 与更完整的误差分析。
+3. 补充标准 MOTChallenge 的 fragmentation、HOTA 和按类别/遮挡级别的误差分析。
 4. 连接真实 ROS2 传感器 topic、TF tree 和时间同步，执行 RViz2 集成测试。
 5. 在不破坏模块边界的前提下增加类别一致性 gating、检测缓存和性能 profiling。
 
