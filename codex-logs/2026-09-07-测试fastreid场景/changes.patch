@@ -1,0 +1,47 @@
+diff --git a/README.md b/README.md
+index 2ebe5e3..c950ddd 100644
+--- a/README.md
++++ b/README.md
+@@ -371,8 +371,9 @@ IDF1 `0.896552`、IDS `10`。这是合成 tracker demo，不是 KITTI Detector 
+    `lidar_detection`、`camera_detection`、`projected_bbox`、`fusion_confidence` 与
+    可选 `track_id`。
+ 
+-当前 Camera 侧是 `SyntheticCameraDetector`，它把 KITTI 2D 标签作为 mock 输入，
+-只用于流程验证；不能据此宣称已经完成真实 Camera detector 或学习式融合。
++单帧 `run_fusion_demo.py` 仍支持 `SyntheticCameraDetector` 作为几何流程 mock；真实
++端到端脚本使用 YOLO26 ONNX Camera detector。FastReID 只作为可选外观身份恢复适配器，
++不把 2D 观测直接写入 3D Kalman state，也不是 neural sensor fusion。
+ 
+ ## 16. ROS2
+ 
+@@ -422,6 +423,30 @@ CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python
+ LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
+ 但没有偷偷插入真实 PointPillars 推理链。
+ 
++## FastReID 身份恢复（可选）
++
++FastReID 作为独立的外观特征适配器，不进入 Tracker 的 Kalman 或 Hungarian 核心。
++使用 VehicleID 的 `vehicleid_bot_R50-ibn.pth`：只有在 2D/3D 已可靠匹配且
++`fusion_confidence` 达到阈值时，才把 YOLO26 crop 的 embedding 写入 gallery；长时间
++消失后，新 3D Track 通过类别、间隔和 cosine similarity 查询 gallery，恢复 public ID。
++
++将完整权重放到 `weights/vehicleid_bot_R50-ibn.pth`，并准备 FastReID 源码（例如
++`/tmp/fast-reid`）后运行：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 \
++/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/run_end_to_end.py --sequence 0000 --device cuda:0 \
++  --enable-reid --fastreid-root /tmp/fast-reid
++```
++
++没有完整权重或 FastReID 依赖时，脚本会明确失败，不会生成伪造的 appearance feature。
++
++在不同场景 `0001` 上启用 FastReID 后，完整 443 帧 replay 实际发生 29 次 public ID
++reactivation：PointPillars 4,687 个 3D detections、YOLO26 3,118 个 2D detections、
++确认轨迹 4,111 个、融合结果 2,349 个，端到端 4.36 FPS（101.65 秒）。结果保存为
++`outputs/metrics/end_to_end_0001_reid.json` 和 `outputs/videos/end_to_end_0001_reid.mp4`。
++
+ ## 17. Benchmark
+ 
+ 运行：

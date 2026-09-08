@@ -1,0 +1,521 @@
+diff --git a/README.md b/README.md
+index 2ebe5e3..88ca274 100644
+--- a/README.md
++++ b/README.md
+@@ -371,8 +371,9 @@ IDF1 `0.896552`、IDS `10`。这是合成 tracker demo，不是 KITTI Detector 
+    `lidar_detection`、`camera_detection`、`projected_bbox`、`fusion_confidence` 与
+    可选 `track_id`。
+ 
+-当前 Camera 侧是 `SyntheticCameraDetector`，它把 KITTI 2D 标签作为 mock 输入，
+-只用于流程验证；不能据此宣称已经完成真实 Camera detector 或学习式融合。
++单帧 `run_fusion_demo.py` 仍支持 `SyntheticCameraDetector` 作为几何流程 mock；真实
++端到端脚本使用 YOLO26 ONNX Camera detector。FastReID 只作为可选外观身份恢复适配器，
++不把 2D 观测直接写入 3D Kalman state，也不是 neural sensor fusion。
+ 
+ ## 16. ROS2
+ 
+@@ -422,6 +423,30 @@ CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python
+ LiDAR 3D box 投影到图像并与 YOLO26 2D box 进行匹配。点云预处理模块仍可独立运行，
+ 但没有偷偷插入真实 PointPillars 推理链。
+ 
++## FastReID 身份恢复（可选）
++
++FastReID 作为独立的外观特征适配器，不进入 Tracker 的 Kalman 或 Hungarian 核心。
++使用 VehicleID 的 `vehicleid_bot_R50-ibn.pth`：只有在 2D/3D 已可靠匹配且
++`fusion_confidence` 达到阈值时，才把 YOLO26 crop 的 embedding 写入 gallery；长时间
++消失后，新 3D Track 通过类别、间隔和 cosine similarity 查询 gallery，恢复 public ID。
++
++将完整权重放到 `weights/vehicleid_bot_R50-ibn.pth`，并准备 FastReID 源码（例如
++`/tmp/fast-reid`）后运行：
++
++```bash
++CUDA_VISIBLE_DEVICES=0 \
++/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/run_end_to_end.py --sequence 0000 --device cuda:0 \
++  --enable-reid --fastreid-root /tmp/fast-reid
++```
++
++没有完整权重或 FastReID 依赖时，脚本会明确失败，不会生成伪造的 appearance feature。
++
++在不同场景 `0001` 上启用 FastReID 后，完整 443 帧 replay 实际发生 29 次 public ID
++reactivation：PointPillars 4,687 个 3D detections、YOLO26 3,118 个 2D detections、
++确认轨迹 4,111 个、融合结果 2,349 个，端到端 4.36 FPS（101.65 秒）。结果保存为
++`outputs/metrics/end_to_end_0001_reid.json` 和 `outputs/videos/end_to_end_0001_reid.mp4`。
++
+ ## 17. Benchmark
+ 
+ 运行：
+@@ -451,9 +476,22 @@ CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python
+   scripts/evaluate_real_mot.py --sequence 0000 --device cuda:0
+ ```
+ 
+-该脚本将 KITTI camera GT box center 通过 calibration 转到 LiDAR 坐标，再与真实
+-PointPillars -> Tracker 输出匹配；结果写入 `outputs/metrics/real_pointpillars_mot.json`。
+-这和 GTDetector benchmark 是两个不同实验。
++该脚本将 KITTI camera GT box center 通过 calibration 转到 LiDAR 坐标，再以 KITTI
++`label_02` 的 `track_id` 作为 ground-truth identity，与真实 PointPillars -> Tracker
++输出做全局 identity 评估。结果写入 `outputs/metrics/real_pointpillars_mot_<sequence>_standard.json`。
++评估使用 `motmetrics`；旧版 PointPillars 环境未安装该包时，脚本使用等价的 SciPy
++Hungarian fallback，并在 JSON 的 `metric_backend` 中标明。这和 GTDetector benchmark
++是两个不同实验。
++
++```bash
++# 生成 KITTI 0000/0001 的标准 MOTChallenge 指标（当前机器无 NVIDIA 驱动时使用 CPU）
++/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/evaluate_real_mot.py --sequence 0000 --device cpu \
++  --output outputs/metrics/real_pointpillars_mot_0000_standard.json
++/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  scripts/evaluate_real_mot.py --sequence 0001 --device cpu \
++  --output outputs/metrics/real_pointpillars_mot_0001_standard.json
++```
+ 
+ ## 18. Results
+ 
+@@ -471,10 +509,18 @@ GT detection input。最近一次运行的 CPU peak RSS 为 `62.94 MB`，GPU mem
+ 因此三种方法在此输入上都达到 1.0。它们只证明 benchmark、association 和 tracking
+ 链路可复现，**不能**用于比较真实 Detector、PointPillars 或端到端系统的性能。
+ 
+-真实 PointPillars `0000` 全序列评估结果为：GT `711`、matches `448`、FP `766`、
+-FN `263`、IDS `8`、MOTA `-0.4585`、IDF1 `0.4655`、FPS `25.10`。负 MOTA 表示
+-当前预训练 detector 的误检/漏检数量已经超过 GT 数量；它是实际 detector-driven
+-结果，不应被隐藏或替换成 GT benchmark 的 1.0。
++真实 PointPillars 的标准 MOTChallenge 全局 identity 评估如下；指标来自
++`outputs/metrics/real_pointpillars_mot_*_standard.json`，匹配距离阈值为 2 m：
++
++| Sequence | Frames | GT | MOTA | IDF1 | IDP | IDR | IDS | FP | FN |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
++| 0000 | 154 | 711 | -0.4585 | 0.4010 | 0.3180 | 0.5429 | 8 | 766 | 263 |
++| 0001 | 443 | 2994 | 0.1700 | 0.6395 | 0.5527 | 0.7589 | 4 | 1799 | 682 |
++
++`0000` 的旧逐帧 IDF1 近似值为 `0.4655`，仅保存在 JSON 的
++`legacy_framewise.IDF1` 中；上表使用 KITTI identity 的全局 ID assignment，不能
++与旧值混用。负 MOTA 表示当前预训练 detector 的误检/漏检数量已经超过 GT 数量；
++它是实际 detector-driven 结果，不应被隐藏或替换成 GT benchmark 的 1.0。
+ 
+ ![MOT baseline comparison](outputs/metrics/mot_comparison.png)
+ 
+@@ -509,7 +555,10 @@ python scripts/render_fusion_video.py --sequence 0000
+   标准 detector mAP/recall；真实 PointPillars 驱动的 MOT 指标已记录，但当前结果较弱。
+ - `SyntheticCameraDetector` 是实验 mock，Camera-LiDAR fusion 目前是几何投影、
+   跨模态匹配与规则置信度，不是 neural fusion。
+-- 当前 IDF1 为基于逐帧位置匹配的可复现 baseline，不替代 MOTChallenge 全局 ID 指标。
++- 真实 PointPillars 的标准 MOTA/IDF1 已按 KITTI `track_id` 计算；GT/NoisyGT 三方法表中的
++  IDF1 仍是 benchmark 内部的逐帧位置匹配结果，不能与真实 detector 指标混用。
++- 当前无 NVIDIA 驱动的环境使用 SciPy fallback 计算全局 identity assignment；
++  `num_fragmentations` 尚未在 fallback 中统计，标准 MOTA/IDF1/IDP/IDR/IDS/FP/FN 已生成。
+ - ROS2 节点为 KITTI replay adapter，不是实时传感器驱动；实际部署需要驱动、TF tree
+   与时间同步。
+ - PointPillars 依赖旧版 OpenMMLab 栈，必须在隔离环境运行。
+@@ -519,7 +568,7 @@ python scripts/render_fusion_video.py --sequence 0000
+ 1. 缓存真实 PointPillars + YOLO26 全序列输出，在相同 detection input 下执行端到端 MOT
+    benchmark，并记录 detector runtime/GPU memory。
+ 2. 增加 YOLO26 训练增强、类别/遮挡分层评估，并替换当前 10 epoch 实验权重为正式模型。
+-3. 实现标准 MOTChallenge 全局 IDF1 与更完整的误差分析。
++3. 补充标准 MOTChallenge 的 fragmentation、HOTA 和按类别/遮挡级别的误差分析。
+ 4. 连接真实 ROS2 传感器 topic、TF tree 和时间同步，执行 RViz2 集成测试。
+ 5. 在不破坏模块边界的前提下增加类别一致性 gating、检测缓存和性能 profiling。
+ 
+diff --git a/docs/experiments.md b/docs/experiments.md
+index 1ea9d9c..ddad6a3 100644
+--- a/docs/experiments.md
++++ b/docs/experiments.md
+@@ -1,6 +1,9 @@
+ # MOT 实验报告
+ 
+ 本报告由 `scripts/evaluate.py` 自动生成，指标来自实际运行结果，不手工填写。
++注意：本报告的三种方法使用 GT/NoisyGT detection input，属于 tracking validation；
++真实 PointPillars 的 KITTI identity 标准 MOT 指标另见
++`outputs/metrics/real_pointpillars_mot_*_standard.json`。
+ 
+ ## Configuration
+ 
+@@ -31,5 +34,6 @@
+ 
+ ## Limitations
+ 
+-- 当前 IDF1 是按帧位置匹配得到的可复现实验基线，不替代完整 MOTChallenge 全局 ID 指标实现。
++- 本报告中的 IDF1 是按帧位置匹配得到的 benchmark 基线，不替代真实 detector 结果中的
++  KITTI identity 全局 IDF1；后者由 `evaluate_real_mot.py` 单独生成。
+ - 若配置真实 detector，脚本会拒绝运行并明确标记 NOT RUN，避免伪造结果。
+diff --git a/docs/project_tutorial_zh.md b/docs/project_tutorial_zh.md
+index 41593d1..dee3000 100644
+--- a/docs/project_tutorial_zh.md
++++ b/docs/project_tutorial_zh.md
+@@ -489,14 +489,38 @@ public ID reactivation：PointPillars 4,687 个 3D 框、YOLO26 3,118 个 2D 框
+ 真实误检、漏检和定位误差进入后，Tracker 的表现怎样？
+ ```
+ 
+-当前真实 PointPillars `0000` 全序列记录：
++当前真实 PointPillars `0000` 全序列的旧版逐帧记录：
+ 
+ ```text
+ GT 711, matches 448, FP 766, FN 263, IDS 8
+ MOTA -0.4585, IDF1 0.4655, FPS 25.10
+ ```
+ 
+-负 MOTA 不是应该隐藏的结果，而是说明真实检测质量和 Tracker 输入质量仍是瓶颈。
++该结果中的 IDF1 是逐帧位置匹配近似，不是全局 identity 指标。负 MOTA 不是应该隐藏的
++结果，而是说明真实检测质量和 Tracker 输入质量仍是瓶颈。
++
++### 12.1 基于 KITTI identity 的标准 MOT 指标
++
++`scripts/evaluate_real_mot.py` 现在使用 KITTI `label_02` 的 `track_id` 作为 GT identity，
++通过全局一对一 identity assignment 计算标准 MOTA、IDF1、IDP、IDR、IDS、FP 和 FN。
++结果文件为：
++
++```text
++outputs/metrics/real_pointpillars_mot_0000_standard.json
++outputs/metrics/real_pointpillars_mot_0001_standard.json
++```
++
++真实结果如下（2 m 三维中心距离阈值）：
++
++```text
++sequence 0000: MOTA -0.4585, IDF1 0.4010, IDP 0.3180, IDR 0.5429, IDS 8, FP 766, FN 263
++sequence 0001: MOTA  0.1700, IDF1 0.6395, IDP 0.5527, IDR 0.7589, IDS 4, FP 1799, FN 682
++```
++
++当前旧版 MMDetection3D 环境没有安装 `motmetrics`，因此本次 JSON 的
++`metric_backend` 为 `scipy_fallback`；该 fallback 使用同样的帧级距离匹配和全局
++Hungarian identity assignment。`0000` 的旧逐帧 IDF1 `0.4655` 仍保留在
++`legacy_framewise`，不能与标准 IDF1 `0.4010` 混用。
+ 
+ ## 13. 常见实践坑
+ 
+diff --git a/scripts/evaluate_real_mot.py b/scripts/evaluate_real_mot.py
+index 5fe8dd4..64bcf60 100644
+--- a/scripts/evaluate_real_mot.py
++++ b/scripts/evaluate_real_mot.py
+@@ -12,6 +12,7 @@ import argparse
+ from datetime import datetime, timezone
+ import json
+ from pathlib import Path
++import subprocess
+ import sys
+ from time import perf_counter
+ 
+@@ -45,6 +46,15 @@ def _resolve(path_value: str | Path) -> Path:
+     return path if path.is_absolute() else REPO_ROOT / path
+ 
+ 
++def _git_commit_hash() -> str:
++    try:
++        return subprocess.check_output(
++            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL
++        ).strip()
++    except (OSError, subprocess.CalledProcessError):
++        return "NOT AVAILABLE"
++
++
+ def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
+     for candidate in (
+         root / split / "calib" / f"{sequence_id}.txt",
+@@ -96,6 +106,195 @@ def _match_frame(
+     return result.matches, result.unmatched_tracks, result.unmatched_detections
+ 
+ 
++def _standard_mot_metrics(
++    truth_frames: list[list[tuple[int, int, np.ndarray]]],
++    prediction_frames: list[list[tuple[int, int, np.ndarray]]],
++    *,
++    distance_threshold: float,
++) -> dict[str, float | int | str | None]:
++    """Compute global identity metrics with the MOTChallenge accumulator.
++
++    KITTI identities are carried by ``label_02`` track IDs.  The accumulator
++    performs frame-level distance matching and then computes the global ID
++    mapping used by standard IDF1/IDP/IDR, unlike the legacy frame-wise
++    ``2 * matches / (2 * matches + FP + FN)`` approximation.
++    """
++
++    if len(truth_frames) != len(prediction_frames):
++        raise ValueError("truth and prediction frame counts must match")
++    if not np.isfinite(distance_threshold) or distance_threshold < 0.0:
++        raise ValueError("distance_threshold must be finite and non-negative")
++    try:
++        import motmetrics as mm
++    except ImportError:  # pragma: no cover - exercised in the legacy detector environment
++        return _standard_mot_metrics_fallback(
++            truth_frames,
++            prediction_frames,
++            distance_threshold=distance_threshold,
++        )
++
++    accumulator = mm.MOTAccumulator(auto_id=False)
++    for frame_index, (truth, predictions) in enumerate(zip(truth_frames, prediction_frames)):
++        gt_ids = [int(item[0]) for item in truth]
++        prediction_ids = [int(item[0]) for item in predictions]
++        distances = np.full((len(truth), len(predictions)), np.nan, dtype=np.float64)
++        for truth_index, (_, truth_class, truth_position) in enumerate(truth):
++            for prediction_index, (_, prediction_class, prediction_position) in enumerate(predictions):
++                # Class gating prevents a Car track from being assigned to a
++                # Pedestrian/Cyclist hypothesis before MOT matching.
++                if truth_class != prediction_class:
++                    continue
++                distance = float(np.linalg.norm(truth_position - prediction_position))
++                if np.isfinite(distance) and distance <= distance_threshold:
++                    distances[truth_index, prediction_index] = distance
++        accumulator.update(gt_ids, prediction_ids, distances, frameid=frame_index)
++
++    metric_names = (
++        "num_frames",
++        "num_objects",
++        "num_matches",
++        "num_misses",
++        "num_false_positives",
++        "num_switches",
++        "num_fragmentations",
++        "mota",
++        "idf1",
++        "idp",
++        "idr",
++        "precision",
++        "recall",
++        "mostly_tracked",
++        "partially_tracked",
++        "mostly_lost",
++    )
++    summary = mm.metrics.create().compute(accumulator, metrics=list(metric_names), name="sequence")
++    row = summary.loc["sequence"]
++    raw: dict[str, float | int | None] = {}
++    for metric_name in metric_names:
++        value = row[metric_name]
++        if isinstance(value, (np.integer, int)):
++            raw[metric_name] = int(value)
++        elif isinstance(value, (np.floating, float)):
++            raw[metric_name] = float(value) if np.isfinite(value) else None
++        else:
++            raw[metric_name] = value
++    # 用项目已有的指标命名风格输出，同时保留 MOTAccumulator 的细分统计。
++    return {
++        "MOTA": raw["mota"],
++        "IDF1": raw["idf1"],
++        "IDP": raw["idp"],
++        "IDR": raw["idr"],
++        "IDS": raw["num_switches"],
++        "FP": raw["num_false_positives"],
++        "FN": raw["num_misses"],
++        "GT": raw["num_objects"],
++        "matches": raw["num_matches"],
++        "distance_matches": int(raw["num_matches"] or 0) + int(raw["num_switches"] or 0),
++        "num_frames": raw["num_frames"],
++        "num_fragmentations": raw["num_fragmentations"],
++        "precision": raw["precision"],
++        "recall": raw["recall"],
++        "mostly_tracked": raw["mostly_tracked"],
++        "partially_tracked": raw["partially_tracked"],
++        "mostly_lost": raw["mostly_lost"],
++        "metric_backend": "motmetrics",
++    }
++
++
++def _standard_mot_metrics_fallback(
++    truth_frames: list[list[tuple[int, int, np.ndarray]]],
++    prediction_frames: list[list[tuple[int, int, np.ndarray]]],
++    *,
++    distance_threshold: float,
++) -> dict[str, float | int | str | None]:
++    """MOTChallenge-compatible fallback for the PointPillars legacy env.
++
++    The detector environment intentionally remains unchanged and may not have
++    the optional ``motmetrics`` package.  This fallback keeps the same global
++    identity assignment definition for MOTA/IDF1/IDP/IDR using SciPy's
++    Hungarian solver; when ``motmetrics`` is available it remains the primary
++    implementation.
++    """
++
++    from scipy.optimize import linear_sum_assignment
++
++    total_gt = total_fp = total_fn = 0
++    pair_counts: dict[tuple[int, int], int] = {}
++    gt_counts: dict[int, int] = {}
++    matched_counts: dict[int, int] = {}
++    previous_ids: dict[int, int] = {}
++    identity_switches = 0
++    distance_matches = 0
++    for truth, predictions in zip(truth_frames, prediction_frames):
++        for gt_id, _, _ in truth:
++            gt_counts[int(gt_id)] = gt_counts.get(int(gt_id), 0) + 1
++        matches, unmatched_truth, unmatched_predictions = _match_frame(
++            truth, predictions, distance_threshold
++        )
++        total_gt += len(truth)
++        total_fn += len(unmatched_truth)
++        total_fp += len(unmatched_predictions)
++        for truth_index, prediction_index in matches:
++            gt_id = int(truth[int(truth_index)][0])
++            prediction_id = int(predictions[int(prediction_index)][0])
++            pair_counts[(gt_id, prediction_id)] = pair_counts.get((gt_id, prediction_id), 0) + 1
++            matched_counts[gt_id] = matched_counts.get(gt_id, 0) + 1
++            previous = previous_ids.get(gt_id)
++            if previous is not None and previous != prediction_id:
++                identity_switches += 1
++            previous_ids[gt_id] = prediction_id
++            distance_matches += 1
++
++    gt_ids = sorted(gt_counts)
++    prediction_ids = sorted({prediction_id for _, prediction_id in pair_counts})
++    if gt_ids and prediction_ids:
++        counts = np.zeros((len(gt_ids), len(prediction_ids)), dtype=np.float64)
++        gt_index = {track_id: index for index, track_id in enumerate(gt_ids)}
++        prediction_index = {track_id: index for index, track_id in enumerate(prediction_ids)}
++        for (gt_id, prediction_id), count in pair_counts.items():
++            counts[gt_index[gt_id], prediction_index[prediction_id]] = count
++        rows, columns = linear_sum_assignment(-counts)
++        idtp = int(counts[rows, columns].sum())
++    else:
++        idtp = 0
++    idfn = total_gt - idtp
++    idfp = (sum(len(frame) for frame in prediction_frames)) - idtp
++    idf1_denominator = 2 * idtp + idfp + idfn
++    mostly_tracked = sum(
++        matched_counts.get(track_id, 0) / max(count, 1) >= 0.8
++        for track_id, count in gt_counts.items()
++    )
++    partially_tracked = sum(
++        0.2 <= matched_counts.get(track_id, 0) / max(count, 1) < 0.8
++        for track_id, count in gt_counts.items()
++    )
++    mostly_lost = sum(
++        matched_counts.get(track_id, 0) / max(count, 1) < 0.2
++        for track_id, count in gt_counts.items()
++    )
++    return {
++        "MOTA": float(1.0 - (total_fn + total_fp + identity_switches) / max(total_gt, 1)),
++        "IDF1": float(2.0 * idtp / idf1_denominator) if idf1_denominator else None,
++        "IDP": float(idtp / (idtp + idfp)) if idtp + idfp else None,
++        "IDR": float(idtp / (idtp + idfn)) if idtp + idfn else None,
++        "IDS": int(identity_switches),
++        "FP": int(total_fp),
++        "FN": int(total_fn),
++        "GT": int(total_gt),
++        # MOTAccumulator 将 SWITCH 事件从 num_matches 中分离；保持相同定义。
++        "matches": int(max(distance_matches - identity_switches, 0)),
++        "distance_matches": int(distance_matches),
++        "num_frames": len(truth_frames),
++        "num_fragmentations": None,
++        "precision": float(distance_matches / (distance_matches + total_fp)) if distance_matches + total_fp else None,
++        "recall": float(distance_matches / total_gt) if total_gt else None,
++        "mostly_tracked": int(mostly_tracked),
++        "partially_tracked": int(partially_tracked),
++        "mostly_lost": int(mostly_lost),
++        "metric_backend": "scipy_fallback",
++    }
++
++
+ def main(argv: list[str] | None = None) -> int:
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--sequence", required=True)
+@@ -138,6 +337,9 @@ def main(argv: list[str] | None = None) -> int:
+         frame_count = 0
+         start_time = perf_counter()
+         frame_keys = getattr(dataset, "_frame_keys", ())
++        truth_frames: list[list[tuple[int, int, np.ndarray]]] = []
++        prediction_frames: list[list[tuple[int, int, np.ndarray]]] = []
++        processed_frame_ids: list[int] = []
+         for index, key in enumerate(frame_keys):
+             if key.frame_id < args.start_frame or (args.end_frame >= 0 and key.frame_id > args.end_frame):
+                 continue
+@@ -151,6 +353,9 @@ def main(argv: list[str] | None = None) -> int:
+             ]
+             truth = _truth_frame(frame, calibration)
+             matches, unmatched_truth, unmatched_predictions = _match_frame(truth, predictions, args.distance_threshold)
++            truth_frames.append(truth)
++            prediction_frames.append(predictions)
++            processed_frame_ids.append(int(key.frame_id))
+             total_gt += len(truth)
+             total_fn += len(unmatched_truth)
+             total_fp += len(unmatched_predictions)
+@@ -165,23 +370,37 @@ def main(argv: list[str] | None = None) -> int:
+             if frame_count % 10 == 0 or frame_count == 1:
+                 print(f"Processed {frame_count} frames; frame={key.frame_id:06d}; detector={len(detections)} tracks={len(predictions)}")
+         elapsed = perf_counter() - start_time
++        if not processed_frame_ids:
++            raise ValueError("no frames selected")
+         idf1_denominator = 2 * idtp + total_fp + total_fn
++        standard = _standard_mot_metrics(
++            truth_frames,
++            prediction_frames,
++            distance_threshold=args.distance_threshold,
++        )
+         metrics = {
+             "status": "OK",
+             "detector": "MMDetection3D PointPillars",
+             "sequence": str(args.sequence),
+-            "frame_range": {"start": args.start_frame, "end": args.end_frame},
++            "frame_range": {"start": processed_frame_ids[0], "end": processed_frame_ids[-1]},
++            "requested_frame_range": {"start": args.start_frame, "end": args.end_frame},
+             "frames": frame_count,
+-            "GT": total_gt,
+-            "matches": idtp,
+-            "FP": total_fp,
+-            "FN": total_fn,
+-            "IDS": total_ids,
+-            "MOTA": 1.0 - (total_fn + total_fp + total_ids) / max(total_gt, 1),
+-            "IDF1": 2 * idtp / idf1_denominator if idf1_denominator else 0.0,
++            # 顶层指标采用标准 MOTChallenge 计算；旧的逐帧近似单独保留。
++            **standard,
+             "runtime_seconds": elapsed,
+             "FPS": frame_count / elapsed if elapsed else 0.0,
+             "distance_threshold_m": args.distance_threshold,
++            "legacy_framewise": {
++                "MOTA": 1.0 - (total_fn + total_fp + total_ids) / max(total_gt, 1),
++                "IDF1": 2 * idtp / idf1_denominator if idf1_denominator else 0.0,
++            },
++            "metric_definition": "MOTChallenge global identity metrics with global ID assignment",
++            "git_commit_hash": _git_commit_hash(),
++            "config": {
++                "dataset": str(REPO_ROOT / "configs" / "dataset.yaml"),
++                "detector": str(REPO_ROOT / "configs" / "detector.yaml"),
++                "tracker": str(REPO_ROOT / "configs" / "tracker.yaml"),
++            },
+             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+         }
+         args.output.parent.mkdir(parents=True, exist_ok=True)
+diff --git a/tests/test_real_evaluation.py b/tests/test_real_evaluation.py
+index e949bc1..040255c 100644
+--- a/tests/test_real_evaluation.py
++++ b/tests/test_real_evaluation.py
+@@ -30,3 +30,42 @@ def test_camera_annotation_is_converted_to_lidar_center() -> None:
+     result = module._camera_annotation_to_lidar(annotation, calibration)
+ 
+     np.testing.assert_allclose(result, (0.0, 1.0, 10.0))
++
++
++def test_standard_mot_metrics_use_global_identity_assignment() -> None:
++    truths = [
++        [(7, 1, np.asarray((0.0, 0.0, 0.0)))],
++        [(7, 1, np.asarray((1.0, 0.0, 0.0)))],
++    ]
++    predictions = [
++        [(3, 1, np.asarray((0.0, 0.0, 0.0)))],
++        [(3, 1, np.asarray((1.0, 0.0, 0.0)))],
++    ]
++
++    metrics = module._standard_mot_metrics(truths, predictions, distance_threshold=0.5)
++
++    assert metrics["MOTA"] == 1.0
++    assert metrics["IDF1"] == 1.0
++    assert metrics["IDP"] == 1.0
++    assert metrics["IDR"] == 1.0
++    assert metrics["IDS"] == 0
++    assert metrics["GT"] == 2
++    assert metrics["matches"] == 2
++
++
++def test_standard_mot_metrics_count_identity_switch_and_class_gate() -> None:
++    truths = [
++        [(7, 1, np.asarray((0.0, 0.0, 0.0))), (8, 2, np.asarray((5.0, 0.0, 0.0)))],
++        [(7, 1, np.asarray((1.0, 0.0, 0.0))), (8, 2, np.asarray((6.0, 0.0, 0.0)))],
++    ]
++    predictions = [
++        [(3, 1, np.asarray((0.0, 0.0, 0.0))), (4, 2, np.asarray((5.0, 0.0, 0.0)))],
++        [(5, 1, np.asarray((1.0, 0.0, 0.0))), (4, 1, np.asarray((6.0, 0.0, 0.0)))],
++    ]
++
++    metrics = module._standard_mot_metrics(truths, predictions, distance_threshold=0.5)
++
++    assert metrics["IDS"] == 1
++    assert metrics["FP"] == 1
++    assert metrics["FN"] == 1
++    assert metrics["GT"] == 4

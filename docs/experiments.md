@@ -1,6 +1,9 @@
 # MOT 实验报告
 
 本报告由 `scripts/evaluate.py` 自动生成，指标来自实际运行结果，不手工填写。
+注意：本报告的三种方法使用 GT/NoisyGT detection input，属于 tracking validation；
+真实 PointPillars 的 KITTI identity 标准 MOT 指标另见
+`outputs/metrics/real_pointpillars_mot_*_standard.json`。
 
 ## Configuration
 
@@ -31,5 +34,6 @@
 
 ## Limitations
 
-- 当前 IDF1 是按帧位置匹配得到的可复现实验基线，不替代完整 MOTChallenge 全局 ID 指标实现。
+- 本报告中的 IDF1 是按帧位置匹配得到的 benchmark 基线，不替代真实 detector 结果中的
+  KITTI identity 全局 IDF1；后者由 `evaluate_real_mot.py` 单独生成。
 - 若配置真实 detector，脚本会拒绝运行并明确标记 NOT RUN，避免伪造结果。

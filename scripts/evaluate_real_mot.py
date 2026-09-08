@@ -12,6 +12,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import subprocess
 import sys
 from time import perf_counter
 
@@ -43,6 +44,15 @@ def _load_yaml(path: Path) -> dict[str, object]:
 def _resolve(path_value: str | Path) -> Path:
     path = Path(path_value)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _git_commit_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "NOT AVAILABLE"
 
 
 def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
@@ -96,6 +106,195 @@ def _match_frame(
     return result.matches, result.unmatched_tracks, result.unmatched_detections
 
 
+def _standard_mot_metrics(
+    truth_frames: list[list[tuple[int, int, np.ndarray]]],
+    prediction_frames: list[list[tuple[int, int, np.ndarray]]],
+    *,
+    distance_threshold: float,
+) -> dict[str, float | int | str | None]:
+    """Compute global identity metrics with the MOTChallenge accumulator.
+
+    KITTI identities are carried by ``label_02`` track IDs.  The accumulator
+    performs frame-level distance matching and then computes the global ID
+    mapping used by standard IDF1/IDP/IDR, unlike the legacy frame-wise
+    ``2 * matches / (2 * matches + FP + FN)`` approximation.
+    """
+
+    if len(truth_frames) != len(prediction_frames):
+        raise ValueError("truth and prediction frame counts must match")
+    if not np.isfinite(distance_threshold) or distance_threshold < 0.0:
+        raise ValueError("distance_threshold must be finite and non-negative")
+    try:
+        import motmetrics as mm
+    except ImportError:  # pragma: no cover - exercised in the legacy detector environment
+        return _standard_mot_metrics_fallback(
+            truth_frames,
+            prediction_frames,
+            distance_threshold=distance_threshold,
+        )
+
+    accumulator = mm.MOTAccumulator(auto_id=False)
+    for frame_index, (truth, predictions) in enumerate(zip(truth_frames, prediction_frames)):
+        gt_ids = [int(item[0]) for item in truth]
+        prediction_ids = [int(item[0]) for item in predictions]
+        distances = np.full((len(truth), len(predictions)), np.nan, dtype=np.float64)
+        for truth_index, (_, truth_class, truth_position) in enumerate(truth):
+            for prediction_index, (_, prediction_class, prediction_position) in enumerate(predictions):
+                # Class gating prevents a Car track from being assigned to a
+                # Pedestrian/Cyclist hypothesis before MOT matching.
+                if truth_class != prediction_class:
+                    continue
+                distance = float(np.linalg.norm(truth_position - prediction_position))
+                if np.isfinite(distance) and distance <= distance_threshold:
+                    distances[truth_index, prediction_index] = distance
+        accumulator.update(gt_ids, prediction_ids, distances, frameid=frame_index)
+
+    metric_names = (
+        "num_frames",
+        "num_objects",
+        "num_matches",
+        "num_misses",
+        "num_false_positives",
+        "num_switches",
+        "num_fragmentations",
+        "mota",
+        "idf1",
+        "idp",
+        "idr",
+        "precision",
+        "recall",
+        "mostly_tracked",
+        "partially_tracked",
+        "mostly_lost",
+    )
+    summary = mm.metrics.create().compute(accumulator, metrics=list(metric_names), name="sequence")
+    row = summary.loc["sequence"]
+    raw: dict[str, float | int | None] = {}
+    for metric_name in metric_names:
+        value = row[metric_name]
+        if isinstance(value, (np.integer, int)):
+            raw[metric_name] = int(value)
+        elif isinstance(value, (np.floating, float)):
+            raw[metric_name] = float(value) if np.isfinite(value) else None
+        else:
+            raw[metric_name] = value
+    # 用项目已有的指标命名风格输出，同时保留 MOTAccumulator 的细分统计。
+    return {
+        "MOTA": raw["mota"],
+        "IDF1": raw["idf1"],
+        "IDP": raw["idp"],
+        "IDR": raw["idr"],
+        "IDS": raw["num_switches"],
+        "FP": raw["num_false_positives"],
+        "FN": raw["num_misses"],
+        "GT": raw["num_objects"],
+        "matches": raw["num_matches"],
+        "distance_matches": int(raw["num_matches"] or 0) + int(raw["num_switches"] or 0),
+        "num_frames": raw["num_frames"],
+        "num_fragmentations": raw["num_fragmentations"],
+        "precision": raw["precision"],
+        "recall": raw["recall"],
+        "mostly_tracked": raw["mostly_tracked"],
+        "partially_tracked": raw["partially_tracked"],
+        "mostly_lost": raw["mostly_lost"],
+        "metric_backend": "motmetrics",
+    }
+
+
+def _standard_mot_metrics_fallback(
+    truth_frames: list[list[tuple[int, int, np.ndarray]]],
+    prediction_frames: list[list[tuple[int, int, np.ndarray]]],
+    *,
+    distance_threshold: float,
+) -> dict[str, float | int | str | None]:
+    """MOTChallenge-compatible fallback for the PointPillars legacy env.
+
+    The detector environment intentionally remains unchanged and may not have
+    the optional ``motmetrics`` package.  This fallback keeps the same global
+    identity assignment definition for MOTA/IDF1/IDP/IDR using SciPy's
+    Hungarian solver; when ``motmetrics`` is available it remains the primary
+    implementation.
+    """
+
+    from scipy.optimize import linear_sum_assignment
+
+    total_gt = total_fp = total_fn = 0
+    pair_counts: dict[tuple[int, int], int] = {}
+    gt_counts: dict[int, int] = {}
+    matched_counts: dict[int, int] = {}
+    previous_ids: dict[int, int] = {}
+    identity_switches = 0
+    distance_matches = 0
+    for truth, predictions in zip(truth_frames, prediction_frames):
+        for gt_id, _, _ in truth:
+            gt_counts[int(gt_id)] = gt_counts.get(int(gt_id), 0) + 1
+        matches, unmatched_truth, unmatched_predictions = _match_frame(
+            truth, predictions, distance_threshold
+        )
+        total_gt += len(truth)
+        total_fn += len(unmatched_truth)
+        total_fp += len(unmatched_predictions)
+        for truth_index, prediction_index in matches:
+            gt_id = int(truth[int(truth_index)][0])
+            prediction_id = int(predictions[int(prediction_index)][0])
+            pair_counts[(gt_id, prediction_id)] = pair_counts.get((gt_id, prediction_id), 0) + 1
+            matched_counts[gt_id] = matched_counts.get(gt_id, 0) + 1
+            previous = previous_ids.get(gt_id)
+            if previous is not None and previous != prediction_id:
+                identity_switches += 1
+            previous_ids[gt_id] = prediction_id
+            distance_matches += 1
+
+    gt_ids = sorted(gt_counts)
+    prediction_ids = sorted({prediction_id for _, prediction_id in pair_counts})
+    if gt_ids and prediction_ids:
+        counts = np.zeros((len(gt_ids), len(prediction_ids)), dtype=np.float64)
+        gt_index = {track_id: index for index, track_id in enumerate(gt_ids)}
+        prediction_index = {track_id: index for index, track_id in enumerate(prediction_ids)}
+        for (gt_id, prediction_id), count in pair_counts.items():
+            counts[gt_index[gt_id], prediction_index[prediction_id]] = count
+        rows, columns = linear_sum_assignment(-counts)
+        idtp = int(counts[rows, columns].sum())
+    else:
+        idtp = 0
+    idfn = total_gt - idtp
+    idfp = (sum(len(frame) for frame in prediction_frames)) - idtp
+    idf1_denominator = 2 * idtp + idfp + idfn
+    mostly_tracked = sum(
+        matched_counts.get(track_id, 0) / max(count, 1) >= 0.8
+        for track_id, count in gt_counts.items()
+    )
+    partially_tracked = sum(
+        0.2 <= matched_counts.get(track_id, 0) / max(count, 1) < 0.8
+        for track_id, count in gt_counts.items()
+    )
+    mostly_lost = sum(
+        matched_counts.get(track_id, 0) / max(count, 1) < 0.2
+        for track_id, count in gt_counts.items()
+    )
+    return {
+        "MOTA": float(1.0 - (total_fn + total_fp + identity_switches) / max(total_gt, 1)),
+        "IDF1": float(2.0 * idtp / idf1_denominator) if idf1_denominator else None,
+        "IDP": float(idtp / (idtp + idfp)) if idtp + idfp else None,
+        "IDR": float(idtp / (idtp + idfn)) if idtp + idfn else None,
+        "IDS": int(identity_switches),
+        "FP": int(total_fp),
+        "FN": int(total_fn),
+        "GT": int(total_gt),
+        # MOTAccumulator 将 SWITCH 事件从 num_matches 中分离；保持相同定义。
+        "matches": int(max(distance_matches - identity_switches, 0)),
+        "distance_matches": int(distance_matches),
+        "num_frames": len(truth_frames),
+        "num_fragmentations": None,
+        "precision": float(distance_matches / (distance_matches + total_fp)) if distance_matches + total_fp else None,
+        "recall": float(distance_matches / total_gt) if total_gt else None,
+        "mostly_tracked": int(mostly_tracked),
+        "partially_tracked": int(partially_tracked),
+        "mostly_lost": int(mostly_lost),
+        "metric_backend": "scipy_fallback",
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence", required=True)
@@ -138,6 +337,9 @@ def main(argv: list[str] | None = None) -> int:
         frame_count = 0
         start_time = perf_counter()
         frame_keys = getattr(dataset, "_frame_keys", ())
+        truth_frames: list[list[tuple[int, int, np.ndarray]]] = []
+        prediction_frames: list[list[tuple[int, int, np.ndarray]]] = []
+        processed_frame_ids: list[int] = []
         for index, key in enumerate(frame_keys):
             if key.frame_id < args.start_frame or (args.end_frame >= 0 and key.frame_id > args.end_frame):
                 continue
@@ -151,6 +353,9 @@ def main(argv: list[str] | None = None) -> int:
             ]
             truth = _truth_frame(frame, calibration)
             matches, unmatched_truth, unmatched_predictions = _match_frame(truth, predictions, args.distance_threshold)
+            truth_frames.append(truth)
+            prediction_frames.append(predictions)
+            processed_frame_ids.append(int(key.frame_id))
             total_gt += len(truth)
             total_fn += len(unmatched_truth)
             total_fp += len(unmatched_predictions)
@@ -165,23 +370,37 @@ def main(argv: list[str] | None = None) -> int:
             if frame_count % 10 == 0 or frame_count == 1:
                 print(f"Processed {frame_count} frames; frame={key.frame_id:06d}; detector={len(detections)} tracks={len(predictions)}")
         elapsed = perf_counter() - start_time
+        if not processed_frame_ids:
+            raise ValueError("no frames selected")
         idf1_denominator = 2 * idtp + total_fp + total_fn
+        standard = _standard_mot_metrics(
+            truth_frames,
+            prediction_frames,
+            distance_threshold=args.distance_threshold,
+        )
         metrics = {
             "status": "OK",
             "detector": "MMDetection3D PointPillars",
             "sequence": str(args.sequence),
-            "frame_range": {"start": args.start_frame, "end": args.end_frame},
+            "frame_range": {"start": processed_frame_ids[0], "end": processed_frame_ids[-1]},
+            "requested_frame_range": {"start": args.start_frame, "end": args.end_frame},
             "frames": frame_count,
-            "GT": total_gt,
-            "matches": idtp,
-            "FP": total_fp,
-            "FN": total_fn,
-            "IDS": total_ids,
-            "MOTA": 1.0 - (total_fn + total_fp + total_ids) / max(total_gt, 1),
-            "IDF1": 2 * idtp / idf1_denominator if idf1_denominator else 0.0,
+            # 顶层指标采用标准 MOTChallenge 计算；旧的逐帧近似单独保留。
+            **standard,
             "runtime_seconds": elapsed,
             "FPS": frame_count / elapsed if elapsed else 0.0,
             "distance_threshold_m": args.distance_threshold,
+            "legacy_framewise": {
+                "MOTA": 1.0 - (total_fn + total_fp + total_ids) / max(total_gt, 1),
+                "IDF1": 2 * idtp / idf1_denominator if idf1_denominator else 0.0,
+            },
+            "metric_definition": "MOTChallenge global identity metrics with global ID assignment",
+            "git_commit_hash": _git_commit_hash(),
+            "config": {
+                "dataset": str(REPO_ROOT / "configs" / "dataset.yaml"),
+                "detector": str(REPO_ROOT / "configs" / "detector.yaml"),
+                "tracker": str(REPO_ROOT / "configs" / "tracker.yaml"),
+            },
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
         args.output.parent.mkdir(parents=True, exist_ok=True)
