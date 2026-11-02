@@ -1,0 +1,34 @@
+# 变更清单
+
+基线 `2202b54fe5cc85c5932d05fdd5e3ee6c9e5f1122` → 当前工作区 ｜ 19 个文件，+513 / -41
+
+```
+1	0	.gitignore
+4	1	AGENTS.md
+11	10	README.md
+1	1	docs/experiments.md
+2	2	docs/project_tutorial_zh.md
+1	0	scripts/evaluate_real_mot.py
+5	4	scripts/prepare_kitti_yolo.py
+1	0	scripts/project_lidar_to_image.py
+1	0	scripts/run_end_to_end.py
+1	0	scripts/run_fusion_demo.py
+12	9	src/robot_perception/dataset/kitti.py
+5	4	tests/test_kitti.py
+11	10	weights/README.md
+79	0	configs/pointpillars_kitti_dbsampler_finetune.py
+109	0	configs/pointpillars_kitti_finetune_40e.py
+18	0	configs/pointpillars_kitti_finetune_extra20.py
+10	0	configs/pointpillars_kitti_reduced_dbsampler.py
+145	0	scripts/evaluate_pointpillars_kitti.py
+96	0	scripts/prepare_kitti_reduced.py
+```
+
+## 本次新增（归档前未纳入 git 跟踪）的文件
+
+- configs/pointpillars_kitti_dbsampler_finetune.py
+- configs/pointpillars_kitti_finetune_40e.py
+- configs/pointpillars_kitti_finetune_extra20.py
+- configs/pointpillars_kitti_reduced_dbsampler.py
+- scripts/evaluate_pointpillars_kitti.py
+- scripts/prepare_kitti_reduced.py

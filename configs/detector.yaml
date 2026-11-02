@@ -21,7 +21,10 @@ detector:
       2: 1
   camera:
     type: yolo26_onnx
+    # 运行时使用 OpenCV DNN，因此这里必须填写 ONNX；该文件应由下方
+    # checkpoint 导出生成，不能直接把 .pt 传给当前适配器。
     model: weights/yolo26s_kitti3class.onnx
+    checkpoint: weights/yolo26s_kitti3class.pt
     score_threshold: 0.25
     iou_threshold: 0.45
     input_size: 640

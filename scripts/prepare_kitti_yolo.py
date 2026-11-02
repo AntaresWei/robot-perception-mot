@@ -25,10 +25,11 @@ def _resolve(path: str | Path) -> Path:
 
 
 def _paths(root: Path, split: str) -> tuple[Path, Path]:
-    image_root = root / "data_tracking_image_2" / split / "image_02"
-    label_root = root / "data_tracking_label_2" / split / "label_02"
-    if image_root.is_dir() and label_root.is_dir():
-        return image_root, label_root
+    for tracking_root in (root / "track", root):
+        image_root = tracking_root / "data_tracking_image_2" / split / "image_02"
+        label_root = tracking_root / "data_tracking_label_2" / split / "label_02"
+        if image_root.is_dir() and label_root.is_dir():
+            return image_root, label_root
     standard = root / split
     image_root, label_root = standard / "image_02", standard / "label_02"
     if image_root.is_dir() and label_root.is_dir():

@@ -11,7 +11,7 @@
 - Dataset sequence: `0000`
 - Frame range: `0..153`
 - Timestamp (UTC): `2026-09-03T07:16:51.987255+00:00`
-- Config: `{"pipeline": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/pipeline.yaml", "dataset": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/dataset.yaml", "detector": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/detector.yaml", "tracker": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/tracker.yaml"}`
+- Config: `{"pipeline": "configs/pipeline.yaml", "dataset": "configs/dataset.yaml", "detector": "configs/detector.yaml", "tracker": "configs/tracker.yaml"}`
 
 ## Metrics
 

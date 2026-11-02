@@ -131,10 +131,11 @@ Loader 兼容以下任一布局，数据和权重均被 Git 忽略：
 ```text
 # 当前本地分拆下载布局
 data/
-├── data_tracking_image_2/training/image_02/0000/000100.png
-├── data_tracking_velodyne/training/velodyne/0000/000100.bin
-├── data_tracking_calib/training/calib/0000.txt
-└── data_tracking_label_2/training/label_02/0000.txt
+└── track/
+    ├── data_tracking_image_2/training/image_02/0000/000100.png
+    ├── data_tracking_velodyne/training/velodyne/0000/000100.bin
+    ├── data_tracking_calib/training/calib/0000.txt
+    └── data_tracking_label_2/training/label_02/0000.txt
 
 # 也兼容标准布局
 data/training/{image_02,velodyne,calib,label_02}/
@@ -279,7 +280,7 @@ python -c "import torch,mmcv,mmdet,mmdet3d,numpy,PIL; print(torch.__version__, t
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python mmdetection3d-1.0/demo/pcd_demo.py \
-  data/data_tracking_velodyne/training/velodyne/0000/000100.bin \
+  data/track/data_tracking_velodyne/training/velodyne/0000/000100.bin \
   mmdetection3d-1.0/configs/pointpillars/hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class.py \
   hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth \
   --device cuda:0 --score-thr 0.3 --out-dir /tmp/pointpillars_demo
@@ -408,7 +409,7 @@ frame；LiDAR Detector 输出必须显式设置 `detection_frame:=lidar`。
 生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+CUDA_VISIBLE_DEVICES=0 conda run -n mmdet3d-kitti python \
   scripts/run_end_to_end.py --sequence 0000 --device cuda:0
 ```
 
@@ -435,7 +436,7 @@ FastReID 作为独立的外观特征适配器，不进入 Tracker 的 Kalman 或
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+conda run -n mmdet3d-kitti python \
   scripts/run_end_to_end.py --sequence 0000 --device cuda:0 \
   --enable-reid --fastreid-root /tmp/fast-reid
 ```
@@ -472,7 +473,7 @@ FPS 与 latency；GT input 的 GPU memory 明确写为 `NOT RUN`。
 真实 PointPillars 驱动的 MOT 评估使用：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+CUDA_VISIBLE_DEVICES=0 conda run -n mmdet3d-kitti python \
   scripts/evaluate_real_mot.py --sequence 0000 --device cuda:0
 ```
 
@@ -485,10 +486,10 @@ Hungarian fallback，并在 JSON 的 `metric_backend` 中标明。这和 GTDetec
 
 ```bash
 # 生成 KITTI 0000/0001 的标准 MOTChallenge 指标（当前机器无 NVIDIA 驱动时使用 CPU）
-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+conda run -n mmdet3d-kitti python \
   scripts/evaluate_real_mot.py --sequence 0000 --device cpu \
   --output outputs/metrics/real_pointpillars_mot_0000_standard.json
-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+conda run -n mmdet3d-kitti python \
   scripts/evaluate_real_mot.py --sequence 0001 --device cpu \
   --output outputs/metrics/real_pointpillars_mot_0001_standard.json
 ```

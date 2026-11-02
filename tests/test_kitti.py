@@ -17,9 +17,10 @@ def _create_dataset_root(
     points: np.ndarray | None = None,
 ) -> Path:
     sequence_id = "0000"
-    image_dir = tmp_path / "data_tracking_image_2" / "training" / "image_02" / sequence_id
-    lidar_dir = tmp_path / "data_tracking_velodyne" / "training" / "velodyne" / sequence_id
-    label_dir = tmp_path / "data_tracking_label_2" / "training" / "label_02"
+    tracking_root = tmp_path / "track"
+    image_dir = tracking_root / "data_tracking_image_2" / "training" / "image_02" / sequence_id
+    lidar_dir = tracking_root / "data_tracking_velodyne" / "training" / "velodyne" / sequence_id
+    label_dir = tracking_root / "data_tracking_label_2" / "training" / "label_02"
     for directory in (image_dir, lidar_dir, label_dir):
         directory.mkdir(parents=True)
 
@@ -78,7 +79,7 @@ def test_invalid_frame_raises_file_not_found(tmp_path: Path) -> None:
 
 def test_invalid_lidar_size_raises_value_error(tmp_path: Path) -> None:
     root = _create_dataset_root(tmp_path)
-    lidar_path = root / "data_tracking_velodyne" / "training" / "velodyne" / "0000" / "000000.bin"
+    lidar_path = root / "track" / "data_tracking_velodyne" / "training" / "velodyne" / "0000" / "000000.bin"
     np.asarray((1.0, 2.0, 3.0), dtype=np.float32).tofile(lidar_path)
     dataset = KittiTrackingDataset(root, load_images=False)
 

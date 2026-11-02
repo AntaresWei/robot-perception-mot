@@ -81,7 +81,7 @@ class KittiTrackingDataset(Sequence[FrameData]):
 
     @staticmethod
     def _resolve_paths(root: Path, split: str) -> _DatasetPaths:
-        # 优先识别标准 KITTI 根目录；本项目本地数据则是四个压缩包拆开的布局。
+        # 优先识别标准 KITTI 根目录；本项目的分拆 Tracking 数据统一位于 root/track。
         standard_root = root / split
         standard_label_dir = standard_root / "label_02"
         standard_paths = _DatasetPaths(
@@ -92,14 +92,17 @@ class KittiTrackingDataset(Sequence[FrameData]):
         if standard_paths.image_dir.is_dir() and standard_paths.lidar_dir.is_dir():
             return standard_paths
 
-        split_label_dir = root / "data_tracking_label_2" / split / "label_02"
-        split_paths = _DatasetPaths(
-            image_dir=root / "data_tracking_image_2" / split / "image_02",
-            lidar_dir=root / "data_tracking_velodyne" / split / "velodyne",
-            label_dir=split_label_dir if split_label_dir.is_dir() else None,
-        )
-        if split_paths.image_dir.is_dir() and split_paths.lidar_dir.is_dir():
-            return split_paths
+        # 默认配置以 data 为 root，分拆的 Tracking 数据位于 data/track；CLI 也可
+        # 直接将 --root 指向 data/track，因此保留第二个候选根目录。
+        for tracking_root in (root / "track", root):
+            split_label_dir = tracking_root / "data_tracking_label_2" / split / "label_02"
+            split_paths = _DatasetPaths(
+                image_dir=tracking_root / "data_tracking_image_2" / split / "image_02",
+                lidar_dir=tracking_root / "data_tracking_velodyne" / split / "velodyne",
+                label_dir=split_label_dir if split_label_dir.is_dir() else None,
+            )
+            if split_paths.image_dir.is_dir() and split_paths.lidar_dir.is_dir():
+                return split_paths
 
         raise FileNotFoundError(
             f"KITTI Tracking image_02 and velodyne directories were not found under {root}"

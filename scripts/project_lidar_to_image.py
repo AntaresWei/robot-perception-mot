@@ -35,6 +35,7 @@ def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
     # 数据集 Loader 支持两种目录布局，这里对 calibration 使用同样的查找规则。
     candidates = (
         root / split / "calib" / f"{sequence_id}.txt",
+        root / "track" / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
         root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
     )
     for candidate in candidates:

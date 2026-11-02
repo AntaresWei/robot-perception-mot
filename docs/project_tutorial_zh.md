@@ -357,7 +357,7 @@ crop -> embedding，gallery 负责 EMA 特征记录，manager 负责长时间消
 
 ```bash
 PYTHONPATH=/tmp/fast-reid:$PYTHONPATH \
-  /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+  conda run -n mmdet3d-kitti python \
   scripts/run_end_to_end.py --sequence 0000 --enable-reid \
   --fastreid-root /tmp/fast-reid
 ```
@@ -439,7 +439,7 @@ FastReID 只在可靠关联后提供车辆外观相似度，作为长时间身�
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
+conda run -n mmdet3d-kitti python \
 scripts/run_end_to_end.py --sequence 0000 --device cuda:0
 ```
 

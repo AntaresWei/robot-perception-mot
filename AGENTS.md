@@ -9,7 +9,7 @@
 - `src/robot_perception/`：主 Python 包。`common` 放跨模块数据类；`dataset`、`pointcloud`、`detection`、`tracking`、`fusion`、`evaluation`、`visualization` 保持职责分离。
 - `configs/`：YAML 配置。数据集根目录、序列、ROI、阈值和协方差等可调参数必须在此声明，禁止在源码中散落 magic number。
 - `tests/`：pytest 测试，命名为 `test_<module>.py`。`data/` 和 `outputs/` 分别存放本地数据与生成结果，均不得提交。
-- `data/` 当前采用 KITTI 分拆下载布局，如 `data_tracking_velodyne/training/velodyne/0000/`；`KittiTrackingDataset` 同时兼容标准 KITTI `training/` 布局。`JMODT-main/` 仅作本地参考，不可作为运行时依赖。
+- `data/` 当前采用 KITTI 分拆下载布局，如 `track/data_tracking_velodyne/training/velodyne/0000/`；`KittiTrackingDataset` 同时兼容标准 KITTI `training/` 布局。`JMODT-main/` 仅作本地参考，不可作为运行时依赖。
 
 ## 环境与代码
 
@@ -36,3 +36,6 @@ bash scripts/codex-log.sh "中文任务标题"
 标题不超过 20 个中文字符。若变更已提交，参数必须位于标题之前，例如 `bash scripts/codex-log.sh --base HEAD~1 "实现数据加载器"`。补全生成归档的 `README.md`，如实记录需求、关键改动、取舍、验证、限制和可复述结论；不要手改 `changes.patch` 或 `files.txt`。
 
 最终汇报应列出修改文件、实现内容、测试命令及结果、发现的问题和未完成事项。Commit 消息建议使用 `feat:`、`fix:`、`test:` 或 `docs:`，但不要代替开发者执行提交。
+
+## GPU
+环境中存在gpu，使用nvidia-smi查看。

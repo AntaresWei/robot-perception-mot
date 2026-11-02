@@ -1,0 +1,327 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 7a0f92f..58884ae 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -9,7 +9,7 @@
+ - `src/robot_perception/`：主 Python 包。`common` 放跨模块数据类；`dataset`、`pointcloud`、`detection`、`tracking`、`fusion`、`evaluation`、`visualization` 保持职责分离。
+ - `configs/`：YAML 配置。数据集根目录、序列、ROI、阈值和协方差等可调参数必须在此声明，禁止在源码中散落 magic number。
+ - `tests/`：pytest 测试，命名为 `test_<module>.py`。`data/` 和 `outputs/` 分别存放本地数据与生成结果，均不得提交。
+-- `data/` 当前采用 KITTI 分拆下载布局，如 `data_tracking_velodyne/training/velodyne/0000/`；`KittiTrackingDataset` 同时兼容标准 KITTI `training/` 布局。`JMODT-main/` 仅作本地参考，不可作为运行时依赖。
++- `data/` 当前采用 KITTI 分拆下载布局，如 `track/data_tracking_velodyne/training/velodyne/0000/`；`KittiTrackingDataset` 同时兼容标准 KITTI `training/` 布局。`JMODT-main/` 仅作本地参考，不可作为运行时依赖。
+ 
+ ## 环境与代码
+ 
+@@ -36,3 +36,6 @@ bash scripts/codex-log.sh "中文任务标题"
+ 标题不超过 20 个中文字符。若变更已提交，参数必须位于标题之前，例如 `bash scripts/codex-log.sh --base HEAD~1 "实现数据加载器"`。补全生成归档的 `README.md`，如实记录需求、关键改动、取舍、验证、限制和可复述结论；不要手改 `changes.patch` 或 `files.txt`。
+ 
+ 最终汇报应列出修改文件、实现内容、测试命令及结果、发现的问题和未完成事项。Commit 消息建议使用 `feat:`、`fix:`、`test:` 或 `docs:`，但不要代替开发者执行提交。
++
++## GPU
++环境中存在gpu，使用nvidia-smi查看。
+diff --git a/README.md b/README.md
+index 88ca274..9e195f3 100644
+--- a/README.md
++++ b/README.md
+@@ -131,10 +131,11 @@ Loader 兼容以下任一布局，数据和权重均被 Git 忽略：
+ ```text
+ # 当前本地分拆下载布局
+ data/
+-├── data_tracking_image_2/training/image_02/0000/000100.png
+-├── data_tracking_velodyne/training/velodyne/0000/000100.bin
+-├── data_tracking_calib/training/calib/0000.txt
+-└── data_tracking_label_2/training/label_02/0000.txt
++└── track/
++    ├── data_tracking_image_2/training/image_02/0000/000100.png
++    ├── data_tracking_velodyne/training/velodyne/0000/000100.bin
++    ├── data_tracking_calib/training/calib/0000.txt
++    └── data_tracking_label_2/training/label_02/0000.txt
+ 
+ # 也兼容标准布局
+ data/training/{image_02,velodyne,calib,label_02}/
+@@ -279,7 +280,7 @@ python -c "import torch,mmcv,mmdet,mmdet3d,numpy,PIL; print(torch.__version__, t
+ 
+ ```bash
+ CUDA_VISIBLE_DEVICES=0 python mmdetection3d-1.0/demo/pcd_demo.py \
+-  data/data_tracking_velodyne/training/velodyne/0000/000100.bin \
++  data/track/data_tracking_velodyne/training/velodyne/0000/000100.bin \
+   mmdetection3d-1.0/configs/pointpillars/hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class.py \
+   hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth \
+   --device cuda:0 --score-thr 0.3 --out-dir /tmp/pointpillars_demo
+@@ -408,7 +409,7 @@ frame；LiDAR Detector 输出必须显式设置 `detection_frame:=lidar`。
+ 生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
+ 
+ ```bash
+-CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++CUDA_VISIBLE_DEVICES=0 conda run -n mmdet3d-kitti python \
+   scripts/run_end_to_end.py --sequence 0000 --device cuda:0
+ ```
+ 
+@@ -435,7 +436,7 @@ FastReID 作为独立的外观特征适配器，不进入 Tracker 的 Kalman 或
+ 
+ ```bash
+ CUDA_VISIBLE_DEVICES=0 \
+-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++conda run -n mmdet3d-kitti python \
+   scripts/run_end_to_end.py --sequence 0000 --device cuda:0 \
+   --enable-reid --fastreid-root /tmp/fast-reid
+ ```
+@@ -472,7 +473,7 @@ FPS 与 latency；GT input 的 GPU memory 明确写为 `NOT RUN`。
+ 真实 PointPillars 驱动的 MOT 评估使用：
+ 
+ ```bash
+-CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++CUDA_VISIBLE_DEVICES=0 conda run -n mmdet3d-kitti python \
+   scripts/evaluate_real_mot.py --sequence 0000 --device cuda:0
+ ```
+ 
+@@ -485,10 +486,10 @@ Hungarian fallback，并在 JSON 的 `metric_backend` 中标明。这和 GTDetec
+ 
+ ```bash
+ # 生成 KITTI 0000/0001 的标准 MOTChallenge 指标（当前机器无 NVIDIA 驱动时使用 CPU）
+-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++conda run -n mmdet3d-kitti python \
+   scripts/evaluate_real_mot.py --sequence 0000 --device cpu \
+   --output outputs/metrics/real_pointpillars_mot_0000_standard.json
+-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++conda run -n mmdet3d-kitti python \
+   scripts/evaluate_real_mot.py --sequence 0001 --device cpu \
+   --output outputs/metrics/real_pointpillars_mot_0001_standard.json
+ ```
+diff --git a/docs/experiments.md b/docs/experiments.md
+index ddad6a3..e70872a 100644
+--- a/docs/experiments.md
++++ b/docs/experiments.md
+@@ -11,7 +11,7 @@
+ - Dataset sequence: `0000`
+ - Frame range: `0..153`
+ - Timestamp (UTC): `2026-09-03T07:16:51.987255+00:00`
+-- Config: `{"pipeline": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/pipeline.yaml", "dataset": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/dataset.yaml", "detector": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/detector.yaml", "tracker": "/data/weijiaman/MyCode/2026/robot-perception-mot/configs/tracker.yaml"}`
++- Config: `{"pipeline": "configs/pipeline.yaml", "dataset": "configs/dataset.yaml", "detector": "configs/detector.yaml", "tracker": "configs/tracker.yaml"}`
+ 
+ ## Metrics
+ 
+diff --git a/docs/project_tutorial_zh.md b/docs/project_tutorial_zh.md
+index dee3000..50c6494 100644
+--- a/docs/project_tutorial_zh.md
++++ b/docs/project_tutorial_zh.md
+@@ -357,7 +357,7 @@ crop -> embedding，gallery 负责 EMA 特征记录，manager 负责长时间消
+ 
+ ```bash
+ PYTHONPATH=/tmp/fast-reid:$PYTHONPATH \
+-  /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++  conda run -n mmdet3d-kitti python \
+   scripts/run_end_to_end.py --sequence 0000 --enable-reid \
+   --fastreid-root /tmp/fast-reid
+ ```
+@@ -439,7 +439,7 @@ FastReID 只在可靠关联后提供车辆外观相似度，作为长时间身
+ 
+ ```bash
+ CUDA_VISIBLE_DEVICES=0 \
+-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++conda run -n mmdet3d-kitti python \
+ scripts/run_end_to_end.py --sequence 0000 --device cuda:0
+ ```
+ 
+diff --git a/scripts/evaluate_real_mot.py b/scripts/evaluate_real_mot.py
+index 64bcf60..052926d 100644
+--- a/scripts/evaluate_real_mot.py
++++ b/scripts/evaluate_real_mot.py
+@@ -58,6 +58,7 @@ def _git_commit_hash() -> str:
+ def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
+     for candidate in (
+         root / split / "calib" / f"{sequence_id}.txt",
++        root / "track" / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
+         root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
+     ):
+         if candidate.is_file():
+diff --git a/scripts/prepare_kitti_yolo.py b/scripts/prepare_kitti_yolo.py
+index 18a7d2b..0926ea0 100644
+--- a/scripts/prepare_kitti_yolo.py
++++ b/scripts/prepare_kitti_yolo.py
+@@ -25,10 +25,11 @@ def _resolve(path: str | Path) -> Path:
+ 
+ 
+ def _paths(root: Path, split: str) -> tuple[Path, Path]:
+-    image_root = root / "data_tracking_image_2" / split / "image_02"
+-    label_root = root / "data_tracking_label_2" / split / "label_02"
+-    if image_root.is_dir() and label_root.is_dir():
+-        return image_root, label_root
++    for tracking_root in (root / "track", root):
++        image_root = tracking_root / "data_tracking_image_2" / split / "image_02"
++        label_root = tracking_root / "data_tracking_label_2" / split / "label_02"
++        if image_root.is_dir() and label_root.is_dir():
++            return image_root, label_root
+     standard = root / split
+     image_root, label_root = standard / "image_02", standard / "label_02"
+     if image_root.is_dir() and label_root.is_dir():
+diff --git a/scripts/project_lidar_to_image.py b/scripts/project_lidar_to_image.py
+index 2a9ccb0..5b63111 100644
+--- a/scripts/project_lidar_to_image.py
++++ b/scripts/project_lidar_to_image.py
+@@ -35,6 +35,7 @@ def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
+     # 数据集 Loader 支持两种目录布局，这里对 calibration 使用同样的查找规则。
+     candidates = (
+         root / split / "calib" / f"{sequence_id}.txt",
++        root / "track" / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
+         root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
+     )
+     for candidate in candidates:
+diff --git a/scripts/run_end_to_end.py b/scripts/run_end_to_end.py
+index 52f9a1f..c0eadcd 100644
+--- a/scripts/run_end_to_end.py
++++ b/scripts/run_end_to_end.py
+@@ -60,6 +60,7 @@ def _resolve(path_value: str | Path) -> Path:
+ def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
+     candidates = (
+         root / split / "calib" / f"{sequence_id}.txt",
++        root / "track" / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
+         root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
+     )
+     for candidate in candidates:
+diff --git a/scripts/run_fusion_demo.py b/scripts/run_fusion_demo.py
+index 53290cb..f432367 100644
+--- a/scripts/run_fusion_demo.py
++++ b/scripts/run_fusion_demo.py
+@@ -41,6 +41,7 @@ def _load_yaml(path: Path) -> dict[str, object]:
+ def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
+     candidates = (
+         root / split / "calib" / f"{sequence_id}.txt",
++        root / "track" / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
+         root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
+     )
+     for candidate in candidates:
+diff --git a/src/robot_perception/dataset/kitti.py b/src/robot_perception/dataset/kitti.py
+index e005907..be0aff9 100644
+--- a/src/robot_perception/dataset/kitti.py
++++ b/src/robot_perception/dataset/kitti.py
+@@ -81,7 +81,7 @@ class KittiTrackingDataset(Sequence[FrameData]):
+ 
+     @staticmethod
+     def _resolve_paths(root: Path, split: str) -> _DatasetPaths:
+-        # 优先识别标准 KITTI 根目录；本项目本地数据则是四个压缩包拆开的布局。
++        # 优先识别标准 KITTI 根目录；本项目的分拆 Tracking 数据统一位于 root/track。
+         standard_root = root / split
+         standard_label_dir = standard_root / "label_02"
+         standard_paths = _DatasetPaths(
+@@ -92,14 +92,17 @@ class KittiTrackingDataset(Sequence[FrameData]):
+         if standard_paths.image_dir.is_dir() and standard_paths.lidar_dir.is_dir():
+             return standard_paths
+ 
+-        split_label_dir = root / "data_tracking_label_2" / split / "label_02"
+-        split_paths = _DatasetPaths(
+-            image_dir=root / "data_tracking_image_2" / split / "image_02",
+-            lidar_dir=root / "data_tracking_velodyne" / split / "velodyne",
+-            label_dir=split_label_dir if split_label_dir.is_dir() else None,
+-        )
+-        if split_paths.image_dir.is_dir() and split_paths.lidar_dir.is_dir():
+-            return split_paths
++        # 默认配置以 data 为 root，分拆的 Tracking 数据位于 data/track；CLI 也可
++        # 直接将 --root 指向 data/track，因此保留第二个候选根目录。
++        for tracking_root in (root / "track", root):
++            split_label_dir = tracking_root / "data_tracking_label_2" / split / "label_02"
++            split_paths = _DatasetPaths(
++                image_dir=tracking_root / "data_tracking_image_2" / split / "image_02",
++                lidar_dir=tracking_root / "data_tracking_velodyne" / split / "velodyne",
++                label_dir=split_label_dir if split_label_dir.is_dir() else None,
++            )
++            if split_paths.image_dir.is_dir() and split_paths.lidar_dir.is_dir():
++                return split_paths
+ 
+         raise FileNotFoundError(
+             f"KITTI Tracking image_02 and velodyne directories were not found under {root}"
+diff --git a/tests/test_kitti.py b/tests/test_kitti.py
+index cb8f880..5cb94d1 100644
+--- a/tests/test_kitti.py
++++ b/tests/test_kitti.py
+@@ -17,9 +17,10 @@ def _create_dataset_root(
+     points: np.ndarray | None = None,
+ ) -> Path:
+     sequence_id = "0000"
+-    image_dir = tmp_path / "data_tracking_image_2" / "training" / "image_02" / sequence_id
+-    lidar_dir = tmp_path / "data_tracking_velodyne" / "training" / "velodyne" / sequence_id
+-    label_dir = tmp_path / "data_tracking_label_2" / "training" / "label_02"
++    tracking_root = tmp_path / "track"
++    image_dir = tracking_root / "data_tracking_image_2" / "training" / "image_02" / sequence_id
++    lidar_dir = tracking_root / "data_tracking_velodyne" / "training" / "velodyne" / sequence_id
++    label_dir = tracking_root / "data_tracking_label_2" / "training" / "label_02"
+     for directory in (image_dir, lidar_dir, label_dir):
+         directory.mkdir(parents=True)
+ 
+@@ -78,7 +79,7 @@ def test_invalid_frame_raises_file_not_found(tmp_path: Path) -> None:
+ 
+ def test_invalid_lidar_size_raises_value_error(tmp_path: Path) -> None:
+     root = _create_dataset_root(tmp_path)
+-    lidar_path = root / "data_tracking_velodyne" / "training" / "velodyne" / "0000" / "000000.bin"
++    lidar_path = root / "track" / "data_tracking_velodyne" / "training" / "velodyne" / "0000" / "000000.bin"
+     np.asarray((1.0, 2.0, 3.0), dtype=np.float32).tofile(lidar_path)
+     dataset = KittiTrackingDataset(root, load_images=False)
+ 
+diff --git a/weights/README.md b/weights/README.md
+index 88ca274..9e195f3 100644
+--- a/weights/README.md
++++ b/weights/README.md
+@@ -131,10 +131,11 @@ Loader 兼容以下任一布局，数据和权重均被 Git 忽略：
+ ```text
+ # 当前本地分拆下载布局
+ data/
+-├── data_tracking_image_2/training/image_02/0000/000100.png
+-├── data_tracking_velodyne/training/velodyne/0000/000100.bin
+-├── data_tracking_calib/training/calib/0000.txt
+-└── data_tracking_label_2/training/label_02/0000.txt
++└── track/
++    ├── data_tracking_image_2/training/image_02/0000/000100.png
++    ├── data_tracking_velodyne/training/velodyne/0000/000100.bin
++    ├── data_tracking_calib/training/calib/0000.txt
++    └── data_tracking_label_2/training/label_02/0000.txt
+ 
+ # 也兼容标准布局
+ data/training/{image_02,velodyne,calib,label_02}/
+@@ -279,7 +280,7 @@ python -c "import torch,mmcv,mmdet,mmdet3d,numpy,PIL; print(torch.__version__, t
+ 
+ ```bash
+ CUDA_VISIBLE_DEVICES=0 python mmdetection3d-1.0/demo/pcd_demo.py \
+-  data/data_tracking_velodyne/training/velodyne/0000/000100.bin \
++  data/track/data_tracking_velodyne/training/velodyne/0000/000100.bin \
+   mmdetection3d-1.0/configs/pointpillars/hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class.py \
+   hv_pointpillars_secfpn_6x8_160e_kitti-3d-3class_20220301_150306-37dc2420.pth \
+   --device cuda:0 --score-thr 0.3 --out-dir /tmp/pointpillars_demo
+@@ -408,7 +409,7 @@ frame；LiDAR Detector 输出必须显式设置 `detection_frame:=lidar`。
+ 生成 Camera 2D box，随后进入项目 Tracker、3D->2D projection 和 Camera-LiDAR fusion：
+ 
+ ```bash
+-CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++CUDA_VISIBLE_DEVICES=0 conda run -n mmdet3d-kitti python \
+   scripts/run_end_to_end.py --sequence 0000 --device cuda:0
+ ```
+ 
+@@ -435,7 +436,7 @@ FastReID 作为独立的外观特征适配器，不进入 Tracker 的 Kalman 或
+ 
+ ```bash
+ CUDA_VISIBLE_DEVICES=0 \
+-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++conda run -n mmdet3d-kitti python \
+   scripts/run_end_to_end.py --sequence 0000 --device cuda:0 \
+   --enable-reid --fastreid-root /tmp/fast-reid
+ ```
+@@ -472,7 +473,7 @@ FPS 与 latency；GT input 的 GPU memory 明确写为 `NOT RUN`。
+ 真实 PointPillars 驱动的 MOT 评估使用：
+ 
+ ```bash
+-CUDA_VISIBLE_DEVICES=0 /data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++CUDA_VISIBLE_DEVICES=0 conda run -n mmdet3d-kitti python \
+   scripts/evaluate_real_mot.py --sequence 0000 --device cuda:0
+ ```
+ 
+@@ -485,10 +486,10 @@ Hungarian fallback，并在 JSON 的 `metric_backend` 中标明。这和 GTDetec
+ 
+ ```bash
+ # 生成 KITTI 0000/0001 的标准 MOTChallenge 指标（当前机器无 NVIDIA 驱动时使用 CPU）
+-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++conda run -n mmdet3d-kitti python \
+   scripts/evaluate_real_mot.py --sequence 0000 --device cpu \
+   --output outputs/metrics/real_pointpillars_mot_0000_standard.json
+-/data/weijiaman/miniconda3/envs/mmdet3d-kitti/bin/python \
++conda run -n mmdet3d-kitti python \
+   scripts/evaluate_real_mot.py --sequence 0001 --device cpu \
+   --output outputs/metrics/real_pointpillars_mot_0001_standard.json
+ ```

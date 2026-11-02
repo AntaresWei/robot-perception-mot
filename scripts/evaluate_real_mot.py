@@ -58,6 +58,7 @@ def _git_commit_hash() -> str:
 def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
     for candidate in (
         root / split / "calib" / f"{sequence_id}.txt",
+        root / "track" / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
         root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
     ):
         if candidate.is_file():

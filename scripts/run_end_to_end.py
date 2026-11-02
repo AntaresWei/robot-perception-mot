@@ -60,6 +60,7 @@ def _resolve(path_value: str | Path) -> Path:
 def _calibration_path(root: Path, split: str, sequence_id: str) -> Path:
     candidates = (
         root / split / "calib" / f"{sequence_id}.txt",
+        root / "track" / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
         root / "data_tracking_calib" / split / "calib" / f"{sequence_id}.txt",
     )
     for candidate in candidates:

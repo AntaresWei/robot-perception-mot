@@ -45,6 +45,7 @@ weights/**/*.onnx
 outputs/logs/*
 outputs/metrics/*
 outputs/training/*
+outputs/
 
 # =====================
 # Media files
